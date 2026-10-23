@@ -26,6 +26,8 @@ use tiny_http_dh::{Header, Method, PoolConfig, Request, Response, Server, Status
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StreamerFeedBack {
     pub remote_ip: EcoString,
+    /// Set from `StreamingContext::slim` — see `ChannelStream::is_slim`.
+    pub is_slim: bool,
     pub streaming_state: StreamingState,
 }
 
@@ -213,6 +215,7 @@ fn streaming_request(
     feedback_channel
         .send(MessageType::PlayerMessage(StreamerFeedBack {
             remote_ip: streaming_ctx.remote_ip.clone(),
+            is_slim: streaming_ctx.slim,
             streaming_state: StreamingState::Started,
         }))
         .unwrap_or_else(|e| {
@@ -272,6 +275,7 @@ fn streaming_request(
     feedback_channel
         .send(MessageType::PlayerMessage(StreamerFeedBack {
             remote_ip: streaming_ctx.remote_ip.clone(),
+            is_slim: streaming_ctx.slim,
             streaming_state: StreamingState::Ended,
         }))
         .unwrap_or_else(|e| {
@@ -392,14 +396,7 @@ fn get_dlna_headers(streaming_ctx: &StreamingContext) -> Vec<Header> {
     };
     headers.push(Header::from_bytes(&b"Content-Type"[..], ct_text.as_bytes()).unwrap());
     // TransferMode.dlna.org is UPnP/DLNA-specific signaling; SlimProto
-    // clients (squeezelite) don't speak DLNA, so skip it for them — a
-    // regular HTTP client would just ignore an unrecognized header, but
-    // there's no reason to claim DLNA compliance to a client that isn't
-    // one. `streaming_ctx.slim` (set from the `?slim=1` marker every
-    // strm-triggered request carries) is a precise signal here, unlike an
-    // IP-based lookup: a UPnP renderer sharing an IP with a SlimProto
-    // renderer (e.g. MoOde exposing both) would otherwise get its own
-    // genuine UPnP request misidentified.
+    // clients (squeezelite) don't speak DLNA, so skip it for them
     if !streaming_ctx.slim {
         headers.push(Header::from_bytes(&b"TransferMode.dlna.org"[..], &b"Streaming"[..]).unwrap());
     }

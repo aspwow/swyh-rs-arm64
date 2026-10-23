@@ -70,11 +70,13 @@ pub struct ChannelStream {
     pub s: Sender<AudioSamples>,
     pub r: Receiver<AudioSamples>,
     pub remote_ip: EcoString,
+    /// distinguishes a SlimProto fetch from an UPnP fetch when
+    /// both share the same `remote_ip` (e.g. MoOde exposing both).
+    pub is_slim: bool,
     pub streaming_format: StreamingFormat,
     fifo: VecDeque<f32>,
     flac_fifo: VecDeque<u8>,
-    // Arc'd so the derived Clone (one per client connect, see `run_server`) is O(1)
-    // instead of duplicating a buffer that can be sizeable at high sample rates
+    // Arc'd to prevent copying when Cloning in the server
     silence: Arc<[f32]>,
     capture_timeout: Duration,
     sending_silence: bool,
@@ -85,32 +87,16 @@ pub struct ChannelStream {
     flac_channel: Option<FlacChannel>,
     /// Set by [`Self::request_stop`] to make `Read::read` return EOF on the
     /// next call, ending the HTTP response even if the client itself never
-    /// closes its end of the connection (e.g. a SlimProto client that stops
-    /// decoding on `strm 'q'` but leaves the TCP connection open) — without
-    /// this, a stalled write to that socket can block the streaming thread
-    /// indefinitely, leaking a `CLIENTS` entry forever. `Arc`'d so every
-    /// clone (the `CLIENTS` map's copy and the one actually being read by
-    /// the streaming thread, see `run_server`) shares the same flag.
+    /// closes its end of the connection
+    /// The Arcs following make sure any clone sees the same values
     stop: Arc<AtomicBool>,
-    /// When this client connected — used to gate the latency-reduction drop
-    /// (see `drop_samples_remaining`) behind `drop_delay`, so it only kicks in
-    /// once the renderer's own buffer has plausibly filled and playback has
-    /// actually started.
+    /// When this client connected — to compute delay before latency drop starts
     connected_at: Instant,
     /// How long to wait after `connected_at` before dropping samples.
     drop_delay: Duration,
-    /// Number of samples still to discard (in whole incoming chunks, see
-    /// `write`) to reduce this client's playback latency. `Arc`'d for the
-    /// same reason as `stop`: every clone of this `ChannelStream` must see
-    /// the same countdown.
+    /// Number of samples still to discard in whole incoming chunks
     drop_samples_remaining: Arc<AtomicUsize>,
-    /// Count of consecutive chunks dropped since the last pass-through (see
-    /// `next_drop_decision`): drops `DROPS_PER_CYCLE` eligible chunks, then
-    /// forwards 1, repeating. Without the periodic pass-through, a drop
-    /// window larger than `capture_timeout` would starve our own receiver
-    /// long enough to spuriously trip the silence fallback in
-    /// `get_samples`, which would add latency instead of reducing it.
-    /// `Arc`'d for the same reason as `drop_samples_remaining`.
+    /// Count of consecutive chunks dropped since the last pass-through
     drop_streak: Arc<AtomicUsize>,
 }
 
@@ -118,6 +104,9 @@ impl ChannelStream {
     /// Number of consecutive chunks `next_drop_decision` drops before
     /// forwarding one, during an active latency-reduction drop window.
     const DROPS_PER_CYCLE: usize = 2;
+    /// max number of chunks that can be queued in the write channel
+    /// before they are dropped
+    const MAX_BACKLOG: usize = 10_000;
 
     pub fn new(
         tx: Sender<AudioSamples>,
@@ -159,6 +148,7 @@ impl ChannelStream {
             capture_timeout: Duration::from_millis(capture_timeout), // silence kicks in after CAPTURE_TIMEOUT seconds
             sending_silence: false,
             remote_ip: context.remote_ip.clone(),
+            is_slim: context.slim,
             wav_hdr,
             use_wave_format: context.needs_wav_hdr(),
             bits_per_sample: context.bits_per_sample as u16,
@@ -198,46 +188,50 @@ impl ChannelStream {
     /// regardless of whether the client itself ever closes the connection.
     /// See the `stop` field's doc comment for why this exists.
     pub fn request_stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// called by the `run_sample_distributor` thread to write the
-    /// f32 samples to our input channel.
-    ///
-    /// Once `drop_delay` has elapsed since this client connected — long
-    /// enough for the renderer's own buffer to fill and playback to actually
-    /// start — incoming chunks are dropped `DROPS_PER_CYCLE`-out-of-every-
-    /// `DROPS_PER_CYCLE + 1` (see `next_drop_decision`) until
-    /// `drop_samples_remaining` reaches zero,
-    /// shortening the renderer's playback lag by roughly that amount.
-    /// Dropping earlier would just delay the renderer's own buffer from
-    /// filling, making things worse; dropping every chunk outright (instead
-    /// of periodically passing one through) could starve our receiver long
-    /// enough to spuriously trip the `capture_timeout` silence fallback in
-    /// `get_samples`, which would add latency instead of reducing it.
-    pub fn write(&self, samples: AudioSamples) {
-        let remaining = self.drop_samples_remaining.load(Ordering::Relaxed);
-        if remaining > 0 && self.connected_at.elapsed() >= self.drop_delay {
-            let drop_streak = self.drop_streak.load(Ordering::Relaxed);
-            let (should_drop, new_remaining, new_drop_streak) =
-                next_drop_decision(remaining, samples.len(), drop_streak);
-            self.drop_samples_remaining
-                .store(new_remaining, Ordering::Relaxed);
-            self.drop_streak.store(new_drop_streak, Ordering::Relaxed);
-            if should_drop {
-                return;
-            }
-        }
-        // don't blow up memory if streaming stalls for some reason
-        // 10_000 messages (capture buffers, not samples) is a quite a lot
-        if self.s.len() < 10_000 {
-            let _ = self.s.send(samples);
-        } else {
+    /// Decides whether to drop this chunk
+    /// - either because the input channel is building up backlog (if streaming
+    ///   is stalled), never buffer more than `MAX_BACKLOG` chunks
+    /// - or as part of the latency-reduction scheme: drops samples at a
+    ///   rate of `DROPS_PER_CYCLE` until the desired latency reduction is
+    ///   achieved, passing through every other chunk so silence detection at
+    ///   both ends doesn't spuriously kick in. Dropping only starts once
+    ///   `drop_delay` has elapsed after connecting (to let the renderer's
+    ///   buffer fill) and stops once the desired reduction is achieved.
+    #[inline(always)]
+    fn should_drop_chunk(&self, chunk_len: usize) -> bool {
+        if self.s.len() >= ChannelStream::MAX_BACKLOG {
             #[cfg(debug_assertions)]
             {
                 debug!("Samples buffer overflow, dropping chunks!");
             }
+            return true;
         }
+        let remaining = self.drop_samples_remaining.load(Ordering::Relaxed);
+        if remaining == 0 || self.connected_at.elapsed() < self.drop_delay {
+            return false;
+        }
+        let (should_drop, new_remaining, new_drop_streak) = next_drop_decision(
+            remaining,
+            chunk_len,
+            self.drop_streak.load(Ordering::Relaxed),
+        );
+        self.drop_samples_remaining
+            .store(new_remaining, Ordering::Relaxed);
+        self.drop_streak.store(new_drop_streak, Ordering::Relaxed);
+        should_drop
+    }
+
+    /// called by the `run_sample_distributor` thread to write the
+    /// f32 samples to our input channel, first discarding the chunk if
+    /// `should_drop_chunk` says to (buffer overflow or latency-reduction).
+    pub fn write(&self, samples: AudioSamples) {
+        if self.should_drop_chunk(samples.len()) {
+            return;
+        }
+        let _ = self.s.send(samples);
     }
 
     /// fill the LPCM/WAV/RF64 fifo buffer with f32 samples
@@ -271,19 +265,7 @@ impl ChannelStream {
             self.flac_fifo.append(&mut VecDeque::from(chunk));
         }
         // fill the buffer with the number of FLAC bytes needed from the fifo
-        let (s1, s2) = self.flac_fifo.as_slices();
-        let (l1, l2) = {
-            if s1.len() >= buf.len() {
-                (buf.len(), 0)
-            } else {
-                (s1.len(), buf.len() - s1.len())
-            }
-        };
-        debug_assert!(l1 + l2 == buf.len());
-        buf[..l1].copy_from_slice(&s1[..l1]);
-        if l2 > 0 {
-            buf[l1..].copy_from_slice(&s2[..l2]);
-        }
+        copy_fifo_front(&self.flac_fifo, buf);
         // remove the copied bytes from the front of the fifo
         self.flac_fifo.retain_back(self.flac_fifo.len() - buf.len());
         Ok(buf.len())
@@ -358,11 +340,32 @@ impl ChannelStream {
     }
 }
 
+/// Copy `buf.len()` bytes from the front of `fifo` into `buf`.
+///
+/// `fifo` is a `VecDeque`, so its contents may be split across two
+/// underlying slices; this copies from both as needed.
+/// the fifo instance here is guaranteed to contain at least
+/// buf.len() bytes by the caller
+fn copy_fifo_front(fifo: &VecDeque<u8>, buf: &mut [u8]) {
+    debug_assert!(fifo.len() >= buf.len());
+    let (s1, s2) = fifo.as_slices();
+    let (l1, l2) = if s1.len() >= buf.len() {
+        (buf.len(), 0)
+    } else {
+        (s1.len(), buf.len() - s1.len())
+    };
+    debug_assert!(l1 + l2 == buf.len());
+    buf[..l1].copy_from_slice(&s1[..l1]);
+    if l2 > 0 {
+        buf[l1..].copy_from_slice(&s2[..l2]);
+    }
+}
+
 /// implement the Read trait for the HTTP writer
 /// filling the read buffer with FLAC or LPCM/WAV/RF64 data
 impl Read for ChannelStream {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        if self.stop.load(Ordering::Acquire) {
+        if self.stop.load(Ordering::Relaxed) {
             return Ok(0); // EOF: ends the HTTP response on this read
         }
         if self.flac_channel.is_some() {
@@ -488,32 +491,20 @@ fn write_fmt_chunk(buf: &mut [u8], sample_rate: u32, bits_per_sample: u16) {
 }
 
 /// Number of interleaved stereo f32 samples corresponding to `ms` milliseconds
-/// at `sample_rate` (2 channels — the whole pipeline is stereo-only, see the
-/// module docs). Shared by `get_silence_buffer` and the latency-reduction
-/// drop countdown set up in `ChannelStream::new`.
+/// at `sample_rate` for 2 channels
 fn stereo_sample_count(sample_rate: u32, ms: u64) -> usize {
     ((u64::from(sample_rate) * 2 * ms) / 1000) as usize
 }
 
-/// New value for a latency-reduction drop countdown after discarding a whole
-/// incoming chunk of `chunk_len` samples: `remaining` decreases by
-/// `chunk_len`, saturating at 0. The chunk that exhausts the countdown may
-/// contain more samples than strictly needed, but it is still dropped whole
-/// (see `ChannelStream::write`), so the actual amount dropped can overshoot
-/// the configured value by up to one chunk.
+/// Compute how many samples still need to be dropped to achieve the desired
+/// latency reduction
 fn next_drop_remaining(remaining: usize, chunk_len: usize) -> usize {
     remaining.saturating_sub(chunk_len)
 }
 
-/// Decide what `ChannelStream::write` should do with one incoming chunk
-/// during an active latency-reduction drop window. Drops
-/// `ChannelStream::DROPS_PER_CYCLE` chunks in a row (counting each against
-/// `remaining`), then passes the next one through unmodified, repeating —
-/// so the receiver on the other end of the channel never sees more than
-/// `DROPS_PER_CYCLE` consecutive drops, bounding the gap between forwarded
-/// chunks to roughly `DROPS_PER_CYCLE` chunks' duration regardless of how
-/// much total audio is being dropped, which keeps `capture_timeout`'s
-/// silence fallback from spuriously kicking in during a long drop window
+/// When latency-reduction is active one sample chunk gets dropped for
+/// every DROPS_PER_CYCLE chunks arriving (until the desired latency
+/// reduction is achieved)
 ///
 /// Returns `(should_drop_this_chunk, new_remaining, new_drop_streak)`.
 fn next_drop_decision(
@@ -862,5 +853,84 @@ mod tests {
         };
         let b2 = { &((i32::from_sample(f32_sample) >> 8).to_be_bytes())[1..] };
         assert_eq!(b1, b2);
+    }
+
+    /// Build a full `VecDeque<u8>` (`len() == cap`) holding `values` in logical
+    /// order, whose live range is physically split at `head_offset` bytes
+    /// from the end of its backing storage (via push/pop churn that never
+    /// exceeds `cap`, so no reallocation straightens it out), giving
+    /// `as_slices()` two non-empty slices: `cap - head_offset` bytes then
+    /// `head_offset` bytes.
+    fn wrapped_fifo(cap: usize, head_offset: usize, values: &[u8]) -> VecDeque<u8> {
+        assert_eq!(values.len(), cap);
+        assert!(head_offset > 0 && head_offset < cap);
+        let mut fifo: VecDeque<u8> = VecDeque::with_capacity(cap);
+        for v in 0..cap as u8 {
+            fifo.push_back(v);
+        }
+        for _ in 0..head_offset {
+            fifo.pop_front();
+        }
+        for v in 0..head_offset as u8 {
+            fifo.push_back(v);
+        }
+        for (i, &v) in values.iter().enumerate() {
+            fifo[i] = v;
+        }
+        fifo
+    }
+
+    #[test]
+    fn test_copy_fifo_front_split_across_wrap() {
+        let values: Vec<u8> = (10..=80).step_by(10).collect();
+        let fifo = wrapped_fifo(8, 6, &values);
+        assert_eq!(fifo.as_slices().0.len(), 2);
+        assert_eq!(fifo.as_slices().1.len(), 6);
+
+        // buf spans both the 2-byte first slice and part of the second
+        let mut buf = [0u8; 4];
+        copy_fifo_front(&fifo, &mut buf);
+        assert_eq!(buf, [10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_copy_fifo_front_entirely_from_first_slice() {
+        let values: Vec<u8> = (10..=80).step_by(10).collect();
+        let fifo = wrapped_fifo(8, 6, &values);
+
+        let mut buf = [0u8; 2];
+        copy_fifo_front(&fifo, &mut buf);
+        assert_eq!(buf, [10, 20]);
+    }
+
+    #[test]
+    fn test_copy_fifo_front_exact_fifo_len() {
+        let values: Vec<u8> = (10..=80).step_by(10).collect();
+        let fifo = wrapped_fifo(8, 6, &values);
+
+        let mut buf = [0u8; 8];
+        copy_fifo_front(&fifo, &mut buf);
+        assert_eq!(buf, values.as_slice());
+    }
+
+    #[test]
+    fn test_copy_fifo_front_contiguous_no_wrap() {
+        let mut fifo: VecDeque<u8> = VecDeque::new();
+        fifo.extend([1, 2, 3, 4]);
+        assert!(fifo.as_slices().1.is_empty());
+
+        let mut buf = [0u8; 3];
+        copy_fifo_front(&fifo, &mut buf);
+        assert_eq!(buf, [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_copy_fifo_front_empty_buf() {
+        let values: Vec<u8> = (10..=80).step_by(10).collect();
+        let fifo = wrapped_fifo(8, 6, &values);
+
+        let mut buf: [u8; 0] = [];
+        copy_fifo_front(&fifo, &mut buf);
+        assert_eq!(buf, [] as [u8; 0]);
     }
 }

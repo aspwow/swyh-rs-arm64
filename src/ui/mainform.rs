@@ -217,20 +217,11 @@ struct StatusTab {
 }
 
 impl AudioTab {
-    fn new(ctx: &TabCtx, audio_sources: &[String]) -> AudioTab {
+    /// Audio source selector: lists capture devices, persists the chosen index/name.
+    fn build_audio_source_choice(ctx: &TabCtx, audio_sources: &[String]) -> Choice {
         let config = ctx.config;
         let default_sample_rate = ctx.default_sample_rate;
 
-        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
-        group.set_label(&fl!("tab-audio"));
-        group.end();
-        let mut audio_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
-        audio_col.set_type(FlexType::Column);
-        audio_col.set_spacing(ROW_SPACING);
-        audio_col.set_margin(MARGIN);
-        audio_col.end();
-
-        // setup audio source choice
         ui_log(LogCategory::Info, &fl!("status-setup-audio"));
         let mut choose_audio_source_but = Choice::new(0, 0, 0, ROW_H, "");
         for name in audio_sources {
@@ -258,18 +249,18 @@ impl AudioTab {
                     conf.sound_source_index = Some(index);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        add_labeled_row(
-            &mut audio_col,
-            &fl!("audio-source-label", "name" = ""),
-            LABEL_W,
-            &choose_audio_source_but,
-        );
+        choose_audio_source_but
+    }
 
-        // streaming format
+    /// Streaming format (FLAC/WAV/LPCM/MP3) choice.
+    fn build_format_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let formats = StreamingFormat::ALL.map(StreamingFormat::as_str);
         let initial_fmt = config
             .streaming_format
@@ -300,17 +291,17 @@ impl AudioTab {
                     conf.streaming_format = Some(newformat);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
-        add_labeled_row(
-            &mut audio_col,
-            &fl!("fmt-label", "format" = ""),
-            LABEL_W,
-            &fmt_choice,
-        );
+        fmt_choice
+    }
 
-        // streaming content length / chunking
+    /// Streaming content length / chunking mode choice.
+    fn build_stream_size_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let streamsize = config
             .streaming_format
             .map_or(StreamSize::U64maxNotChunked, |fmt| {
@@ -358,17 +349,17 @@ impl AudioTab {
                         "size" = &newsize
                     ),
                 );
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
-        add_labeled_row(
-            &mut audio_col,
-            &fl!("strmsize-label", "size" = ""),
-            LABEL_W,
-            &ss_choice,
-        );
+        ss_choice
+    }
 
-        // 24-bit checkbox
+    /// 24-bit and dither checkboxes — paired because toggling 24-bit forces dither off.
+    fn build_bit_depth_controls(ctx: &TabCtx) -> (CheckButton, CheckButton) {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let b24_bit_lbl = fl!("chk-24bit");
         let mut b24_bit = CheckButton::new(0, 0, 0, 0, b24_bit_lbl.as_str());
         if config.bits_per_sample.unwrap_or(16) == 24 {
@@ -396,7 +387,7 @@ impl AudioTab {
                     conf.use_dither = Some(is_set);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
         b24_bit.set_callback({
@@ -420,10 +411,17 @@ impl AudioTab {
                     }
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
-        // sample rate choice — index 0 is "System Default", indices 1+ are fixed rates
+        (b24_bit, use_dither)
+    }
+
+    /// Sample rate choice — index 0 is "System Default", indices 1+ are fixed rates.
+    fn build_sample_rate_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let initial_sr_idx = match config.sample_rate {
             None => 0,
             Some(rate) => SAMPLE_RATES
@@ -455,24 +453,18 @@ impl AudioTab {
                     conf.sample_rate = new_rate;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        let lbl_sr = Frame::default().with_label(&fl!("sample-rate-label"));
-        let mut flx_b24 = Flex::new(0, 0, GW, ROW_H, "");
-        flx_b24.set_spacing(5);
-        flx_b24.set_type(FlexType::Row);
-        flx_b24.end();
-        flx_b24.add(&b24_bit);
-        flx_b24.fixed(&b24_bit, 80);
-        flx_b24.add(&lbl_sr);
-        flx_b24.fixed(&lbl_sr, LABEL_W);
-        flx_b24.add(&sr_choice);
-        audio_col.add(&flx_b24);
-        audio_col.fixed(&flx_b24, ROW_H);
+        sr_choice
+    }
 
-        // inject silence checkbox
+    /// "Inject silence" checkbox.
+    fn build_inject_silence_checkbox(ctx: &TabCtx) -> CheckButton {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let inj_silence_lbl = fl!("chk-inject-silence");
         let mut inj_silence = CheckButton::new(0, 0, 0, 0, inj_silence_lbl.as_str());
         if config.inject_silence.unwrap_or(false) {
@@ -491,22 +483,18 @@ impl AudioTab {
                     conf.inject_silence = Some(is_set);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        let mut flx_inj = Flex::new(0, 0, GW, ROW_H, "");
-        flx_inj.set_type(FlexType::Row);
-        flx_inj.end();
-        flx_inj.add(&inj_silence);
-        flx_inj.add(&use_dither);
-        audio_col.add(&flx_inj);
-        audio_col.fixed(&flx_inj, ROW_H);
+        inj_silence
+    }
 
-        // initial buffer
-        let label_ms = Frame::default()
-            .with_label(&fl!("buffer-label"))
-            .with_align(Align::Left | Align::Inside);
+    /// Initial upfront buffering delay (ms) input.
+    fn build_buffer_input(ctx: &TabCtx) -> IntInput {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let mut upfront_buffer_ms = IntInput::new(0, 0, 50, 0, "");
         upfront_buffer_ms.set_maximum_size(5);
         let b_config = config.buffering_delay_msec.unwrap_or_default();
@@ -529,24 +517,18 @@ impl AudioTab {
                         conf.buffering_delay_msec = Some(b as u32);
                         let _ = conf.update_config();
                     }
-                    sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                    sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
         });
-        let mut flx_buf = Flex::new(0, 0, GW, ROW_H, "");
-        flx_buf.set_spacing(10);
-        flx_buf.set_type(FlexType::Row);
-        flx_buf.end();
-        flx_buf.add(&label_ms);
-        flx_buf.add(&upfront_buffer_ms);
-        flx_buf.fixed(&upfront_buffer_ms, 50);
-        audio_col.add(&flx_buf);
-        audio_col.fixed(&flx_buf, ROW_H);
+        upfront_buffer_ms
+    }
 
-        // latency reduction delay (how long to wait after connecting before dropping)
-        let label_lat_delay = Frame::default()
-            .with_label(&fl!("latency-reduction-delay-label"))
-            .with_align(Align::Left | Align::Inside);
+    /// Latency reduction delay (ms) input — how long to wait after connecting before dropping.
+    fn build_latency_delay_input(ctx: &TabCtx) -> IntInput {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let mut latency_delay_ms = IntInput::new(0, 0, 50, 0, "");
         latency_delay_ms.set_maximum_size(5);
         let lat_delay_config = config.latency_reduction_delay_msec.unwrap_or_default();
@@ -569,14 +551,18 @@ impl AudioTab {
                         conf.latency_reduction_delay_msec = Some(d as u32);
                         let _ = conf.update_config();
                     }
-                    sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                    sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
         });
-        // latency reduction amount (how much audio to drop once the delay above has elapsed)
-        let label_lat_amount = Frame::default()
-            .with_label(&fl!("latency-reduction-label"))
-            .with_align(Align::Left | Align::Inside);
+        latency_delay_ms
+    }
+
+    /// Latency reduction amount (ms) input — how much audio to drop once the delay has elapsed.
+    fn build_latency_amount_input(ctx: &TabCtx) -> IntInput {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let mut latency_reduction_ms = IntInput::new(0, 0, 50, 0, "");
         latency_reduction_ms.set_maximum_size(5);
         let lat_amount_config = config.latency_reduction_msec.unwrap_or_default();
@@ -599,10 +585,102 @@ impl AudioTab {
                         conf.latency_reduction_msec = Some(l as u32);
                         let _ = conf.update_config();
                     }
-                    sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                    sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
         });
+        latency_reduction_ms
+    }
+
+    fn new(ctx: &TabCtx, audio_sources: &[String]) -> AudioTab {
+        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
+        group.set_label(&fl!("tab-audio"));
+        group.end();
+        let mut audio_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
+        audio_col.set_type(FlexType::Column);
+        audio_col.set_spacing(ROW_SPACING);
+        audio_col.set_margin(MARGIN);
+        audio_col.end();
+
+        // setup audio source choice
+        let choose_audio_source_but = Self::build_audio_source_choice(ctx, audio_sources);
+        add_labeled_row(
+            &mut audio_col,
+            &fl!("audio-source-label", "name" = ""),
+            LABEL_W,
+            &choose_audio_source_but,
+        );
+
+        // streaming format
+        let fmt_choice = Self::build_format_choice(ctx);
+        add_labeled_row(
+            &mut audio_col,
+            &fl!("fmt-label", "format" = ""),
+            LABEL_W,
+            &fmt_choice,
+        );
+
+        // streaming content length / chunking
+        let ss_choice = Self::build_stream_size_choice(ctx);
+        add_labeled_row(
+            &mut audio_col,
+            &fl!("strmsize-label", "size" = ""),
+            LABEL_W,
+            &ss_choice,
+        );
+
+        // 24-bit and dither checkboxes
+        let (b24_bit, use_dither) = Self::build_bit_depth_controls(ctx);
+        // sample rate choice — index 0 is "System Default", indices 1+ are fixed rates
+        let sr_choice = Self::build_sample_rate_choice(ctx);
+        let lbl_sr = Frame::default().with_label(&fl!("sample-rate-label"));
+        let mut flx_b24 = Flex::new(0, 0, GW, ROW_H, "");
+        flx_b24.set_spacing(5);
+        flx_b24.set_type(FlexType::Row);
+        flx_b24.end();
+        flx_b24.add(&b24_bit);
+        flx_b24.fixed(&b24_bit, 80);
+        flx_b24.add(&lbl_sr);
+        flx_b24.fixed(&lbl_sr, LABEL_W);
+        flx_b24.add(&sr_choice);
+        audio_col.add(&flx_b24);
+        audio_col.fixed(&flx_b24, ROW_H);
+
+        // inject silence checkbox
+        let inj_silence = Self::build_inject_silence_checkbox(ctx);
+        let mut flx_inj = Flex::new(0, 0, GW, ROW_H, "");
+        flx_inj.set_type(FlexType::Row);
+        flx_inj.end();
+        flx_inj.add(&inj_silence);
+        flx_inj.add(&use_dither);
+        audio_col.add(&flx_inj);
+        audio_col.fixed(&flx_inj, ROW_H);
+
+        // initial buffer
+        let label_ms = Frame::default()
+            .with_label(&fl!("buffer-label"))
+            .with_align(Align::Left | Align::Inside);
+        let upfront_buffer_ms = Self::build_buffer_input(ctx);
+        let mut flx_buf = Flex::new(0, 0, GW, ROW_H, "");
+        flx_buf.set_spacing(10);
+        flx_buf.set_type(FlexType::Row);
+        flx_buf.end();
+        flx_buf.add(&label_ms);
+        flx_buf.add(&upfront_buffer_ms);
+        flx_buf.fixed(&upfront_buffer_ms, 50);
+        audio_col.add(&flx_buf);
+        audio_col.fixed(&flx_buf, ROW_H);
+
+        // latency reduction delay (how long to wait after connecting before dropping)
+        let label_lat_delay = Frame::default()
+            .with_label(&fl!("latency-reduction-delay-label"))
+            .with_align(Align::Left | Align::Inside);
+        let latency_delay_ms = Self::build_latency_delay_input(ctx);
+        // latency reduction amount (how much audio to drop once the delay above has elapsed)
+        let label_lat_amount = Frame::default()
+            .with_label(&fl!("latency-reduction-label"))
+            .with_align(Align::Left | Align::Inside);
+        let latency_reduction_ms = Self::build_latency_amount_input(ctx);
         let mut flx_lat = Flex::new(0, 0, GW, ROW_H, "");
         flx_lat.set_spacing(10);
         flx_lat.set_type(FlexType::Row);
@@ -631,24 +709,11 @@ impl AudioTab {
 }
 
 impl NetworkTab {
-    fn new(
-        ctx: &TabCtx,
-        networks: &[String],
-        ssdp_kick_tx: crossbeam_channel::Sender<()>,
-    ) -> NetworkTab {
+    /// Active network interface choice.
+    fn build_network_choice(ctx: &TabCtx, networks: &[String]) -> Choice {
         let config = ctx.config;
         let default_sample_rate = ctx.default_sample_rate;
 
-        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
-        group.set_label(&fl!("tab-network"));
-        group.end();
-        let mut network_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
-        network_col.set_type(FlexType::Column);
-        network_col.set_spacing(ROW_SPACING);
-        network_col.set_margin(MARGIN);
-        network_col.end();
-
-        // network selection
         let initial_nw_idx = config
             .last_network
             .as_ref()
@@ -678,18 +743,17 @@ impl NetworkTab {
                     conf.last_network = Some(name);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        add_labeled_row(
-            &mut network_col,
-            &fl!("active-network", "addr" = ""),
-            LABEL_W_NET,
-            &choose_network_but,
-        );
+        choose_network_but
+    }
 
-        // HTTP server listen port
+    /// HTTP server listen port input.
+    fn build_listen_port_input(ctx: &TabCtx) -> IntInput {
+        let default_sample_rate = ctx.default_sample_rate;
+
         let mut listen_port = IntInput::new(0, 0, 0, 0, "");
         listen_port.set_value(&get_config().server_port.unwrap_or_default().to_string());
         listen_port.set_maximum_size(5);
@@ -708,19 +772,19 @@ impl NetworkTab {
                         conf.server_port = Some(new_value as u16);
                         let _ = conf.update_config();
                     }
-                    sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                    sb.set_text(&StatusTab::format_status(default_sample_rate));
                     config_changed.set(true);
                 }
             }
         });
-        add_labeled_row(
-            &mut network_col,
-            &fl!("http-port-label"),
-            LABEL_W_NET,
-            &listen_port,
-        );
+        listen_port
+    }
 
-        // SSDP interval
+    /// SSDP discovery interval counter (minutes; zero disables periodic discovery).
+    fn build_ssdp_interval_counter(ctx: &TabCtx) -> Counter {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let mut ssdp_interval = Counter::new(0, 0, 0, 0, "");
         ssdp_interval.set_value(config.ssdp_interval_mins);
         ssdp_interval.handle({
@@ -750,7 +814,7 @@ impl NetworkTab {
                                 LogCategory::Warning,
                                 &fl!("warn-ssdp-changed", "interval" = ssdp_interval_mins),
                             );
-                            sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                            sb.set_text(&StatusTab::format_status(default_sample_rate));
                             config_changed.set(true);
                         }
                         true
@@ -759,14 +823,13 @@ impl NetworkTab {
                 }
             }
         });
-        add_labeled_row(
-            &mut network_col,
-            &fl!("ssdp-interval-label"),
-            LABEL_W_NET,
-            &ssdp_interval,
-        );
+        ssdp_interval
+    }
 
-        // "Run SSDP discovery now" button — disabled when SSDP interval is 0 (thread not running)
+    /// "Run SSDP discovery now" button — disabled when SSDP interval is 0 (thread not running).
+    fn build_ssdp_now_button(ctx: &TabCtx, ssdp_kick_tx: crossbeam_channel::Sender<()>) -> Button {
+        let config = ctx.config;
+
         let mut ssdp_now_btn = Button::new(0, 0, 0, ROW_H, "");
         ssdp_now_btn.set_label(&fl!("btn-ssdp-discover"));
         if config.ssdp_interval_mins <= 0.0 {
@@ -775,6 +838,52 @@ impl NetworkTab {
         ssdp_now_btn.set_callback(move |_| {
             let _ = ssdp_kick_tx.send(());
         });
+        ssdp_now_btn
+    }
+
+    fn new(
+        ctx: &TabCtx,
+        networks: &[String],
+        ssdp_kick_tx: crossbeam_channel::Sender<()>,
+    ) -> NetworkTab {
+        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
+        group.set_label(&fl!("tab-network"));
+        group.end();
+        let mut network_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
+        network_col.set_type(FlexType::Column);
+        network_col.set_spacing(ROW_SPACING);
+        network_col.set_margin(MARGIN);
+        network_col.end();
+
+        // network selection
+        let choose_network_but = Self::build_network_choice(ctx, networks);
+        add_labeled_row(
+            &mut network_col,
+            &fl!("active-network", "addr" = ""),
+            LABEL_W_NET,
+            &choose_network_but,
+        );
+
+        // HTTP server listen port
+        let listen_port = Self::build_listen_port_input(ctx);
+        add_labeled_row(
+            &mut network_col,
+            &fl!("http-port-label"),
+            LABEL_W_NET,
+            &listen_port,
+        );
+
+        // SSDP interval
+        let ssdp_interval = Self::build_ssdp_interval_counter(ctx);
+        add_labeled_row(
+            &mut network_col,
+            &fl!("ssdp-interval-label"),
+            LABEL_W_NET,
+            &ssdp_interval,
+        );
+
+        // "Run SSDP discovery now" button
+        let ssdp_now_btn = Self::build_ssdp_now_button(ctx, ssdp_kick_tx);
         network_col.add(&ssdp_now_btn);
         network_col.fixed(&ssdp_now_btn, ROW_H);
 
@@ -788,20 +897,11 @@ impl NetworkTab {
 }
 
 impl AppTab {
-    fn new(ctx: &TabCtx) -> AppTab {
+    /// UI language choice.
+    fn build_language_choice(ctx: &TabCtx) -> Choice {
         let config = ctx.config;
         let default_sample_rate = ctx.default_sample_rate;
 
-        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
-        group.set_label(&fl!("tab-app"));
-        group.end();
-        let mut app_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
-        app_col.set_type(FlexType::Column);
-        app_col.set_spacing(ROW_SPACING);
-        app_col.set_margin(MARGIN);
-        app_col.end();
-
-        // Language choice
         let available_langs = i18n::available_languages();
         let cur_lang = config
             .language
@@ -835,18 +935,18 @@ impl AppTab {
                     conf.language = Some(lang);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        add_labeled_row(
-            &mut app_col,
-            &fl!("language-label", "lang" = ""),
-            LABEL_W,
-            &lang_button,
-        );
+        lang_button
+    }
 
-        // Theme choice
+    /// Color theme choice; applies the theme immediately, including at startup.
+    fn build_theme_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         if let Some(theme) = config.color_theme {
             MainForm::apply_theme(theme.into());
         }
@@ -873,20 +973,21 @@ impl AppTab {
                     conf.color_theme = Some(new_theme);
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
-        add_labeled_row(
-            &mut app_col,
-            &fl!("color-theme-label", "name" = ""),
-            LABEL_W,
-            &theme_button,
-        );
+        theme_button
+    }
 
-        // Widget style choice
-        // note: unlike the color theme, a widget style change cannot be cleanly
-        // undone at runtime (fltk-theme has no "reset to default box drawing"),
-        // so it's only applied at startup and otherwise requires a restart
+    /// Widget style choice.
+    ///
+    /// Note: unlike the color theme, a widget style change cannot be cleanly
+    /// undone at runtime (fltk-theme has no "reset to default box drawing"),
+    /// so it's only applied at startup and otherwise requires a restart.
+    fn build_widget_style_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         if let Some(style) = config.widget_scheme {
             MainForm::apply_scheme(style.into());
         }
@@ -917,18 +1018,18 @@ impl AppTab {
                     LogCategory::Warning,
                     &fl!("warn-widget-style-changed", "style" = name),
                 );
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        add_labeled_row(
-            &mut app_col,
-            &fl!("widget-style-label", "style" = ""),
-            LABEL_W,
-            &style_button,
-        );
+        style_button
+    }
 
-        // log level choice
+    /// Log level choice (Info/Debug).
+    fn build_log_level_choice(ctx: &TabCtx) -> Choice {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let log_levels = ["Info", "Debug"];
         let initial_ll_idx = if config.log_level == LevelFilter::Debug {
             1i32
@@ -961,18 +1062,18 @@ impl AppTab {
                     conf.log_level = loglevel;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        add_labeled_row(
-            &mut app_col,
-            &fl!("log-level-label", "level" = ""),
-            LABEL_W,
-            &log_level_choice,
-        );
+        log_level_choice
+    }
 
-        // auto_resume + auto_reconnect row
+    /// "Auto resume" checkbox.
+    fn build_auto_resume_checkbox(ctx: &TabCtx) -> CheckButton {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let auto_resume_lbl = fl!("chk-autoresume");
         let mut auto_resume = CheckButton::new(0, 0, 0, 0, auto_resume_lbl.as_str());
         if config.auto_resume {
@@ -990,9 +1091,17 @@ impl AppTab {
                     conf.auto_resume = is_set;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
+        auto_resume
+    }
+
+    /// "Auto reconnect" checkbox.
+    fn build_auto_reconnect_checkbox(ctx: &TabCtx) -> CheckButton {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let auto_reconnect_lbl = fl!("chk-autoreconnect");
         let mut auto_reconnect = CheckButton::new(0, 0, 0, 0, auto_reconnect_lbl.as_str());
         if config.auto_reconnect {
@@ -1010,26 +1119,19 @@ impl AppTab {
                     conf.auto_reconnect = is_set;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
-        let mut flx_autoresume = Flex::new(0, 0, GW, ROW_H, "");
-        flx_autoresume.set_type(FlexType::Row);
-        flx_autoresume.end();
-        flx_autoresume.add(&auto_resume);
-        app_col.add(&flx_autoresume);
-        app_col.fixed(&flx_autoresume, ROW_H);
+        auto_reconnect
+    }
 
-        let mut flx_autoreconnect = Flex::new(0, 0, GW, ROW_H, "");
-        flx_autoreconnect.set_type(FlexType::Row);
-        flx_autoreconnect.end();
-        flx_autoreconnect.add(&auto_reconnect);
-        app_col.add(&flx_autoreconnect);
-        app_col.fixed(&flx_autoreconnect, ROW_H);
+    /// SlimProto (squeezelite) discovery enable checkbox — startup-time setting,
+    /// like ssdp_interval_mins, so toggling it needs a restart to take
+    /// effect (see spawn_slim_discovery's gate in swyh-rs.rs).
+    fn build_enable_slimproto_checkbox(ctx: &TabCtx) -> CheckButton {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
 
-        // SlimProto (squeezelite) discovery on/off — startup-time setting,
-        // like ssdp_interval_mins, so toggling it needs a restart to take
-        // effect (see spawn_slim_discovery's gate in swyh-rs.rs)
         let enable_slimproto_lbl = fl!("chk-enable-slimproto");
         let mut enable_slimproto = CheckButton::new(0, 0, 0, 0, enable_slimproto_lbl.as_str());
         if config.enable_slimproto {
@@ -1049,18 +1151,19 @@ impl AppTab {
                     conf.enable_slimproto = is_set;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
         });
-        let mut flx_enable_slimproto = Flex::new(0, 0, GW, ROW_H, "");
-        flx_enable_slimproto.set_type(FlexType::Row);
-        flx_enable_slimproto.end();
-        flx_enable_slimproto.add(&enable_slimproto);
-        app_col.add(&flx_enable_slimproto);
-        app_col.fixed(&flx_enable_slimproto, ROW_H);
+        enable_slimproto
+    }
 
-        // RMS animation enable + meters
+    /// RMS monitor enable checkbox plus its two level meters — paired because
+    /// the checkbox's callback resets both meters.
+    fn build_rms_monitor_controls(ctx: &TabCtx) -> (CheckButton, Progress, Progress) {
+        let config = ctx.config;
+        let default_sample_rate = ctx.default_sample_rate;
+
         let show_rms_lbl = fl!("chk-rms-monitor");
         let mut show_rms = CheckButton::new(0, 0, 0, 0, show_rms_lbl.as_str());
         if config.monitor_rms {
@@ -1095,9 +1198,86 @@ impl AppTab {
                     conf.monitor_rms = run_rms;
                     let _ = conf.update_config();
                 }
-                sb.set_text(&MainForm::format_config_status(default_sample_rate));
+                sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
+        (show_rms, rms_mon_l, rms_mon_r)
+    }
+
+    fn new(ctx: &TabCtx) -> AppTab {
+        let mut group = Group::new(0, TAB_BAR_H, GW, INNER_H, "");
+        group.set_label(&fl!("tab-app"));
+        group.end();
+        let mut app_col = Flex::new(0, TAB_BAR_H, GW, INNER_H, "");
+        app_col.set_type(FlexType::Column);
+        app_col.set_spacing(ROW_SPACING);
+        app_col.set_margin(MARGIN);
+        app_col.end();
+
+        // Language choice
+        let lang_button = Self::build_language_choice(ctx);
+        add_labeled_row(
+            &mut app_col,
+            &fl!("language-label", "lang" = ""),
+            LABEL_W,
+            &lang_button,
+        );
+
+        // Theme choice
+        let theme_button = Self::build_theme_choice(ctx);
+        add_labeled_row(
+            &mut app_col,
+            &fl!("color-theme-label", "name" = ""),
+            LABEL_W,
+            &theme_button,
+        );
+
+        // Widget style choice
+        let style_button = Self::build_widget_style_choice(ctx);
+        add_labeled_row(
+            &mut app_col,
+            &fl!("widget-style-label", "style" = ""),
+            LABEL_W,
+            &style_button,
+        );
+
+        // log level choice
+        let log_level_choice = Self::build_log_level_choice(ctx);
+        add_labeled_row(
+            &mut app_col,
+            &fl!("log-level-label", "level" = ""),
+            LABEL_W,
+            &log_level_choice,
+        );
+
+        // auto_resume + auto_reconnect row
+        let auto_resume = Self::build_auto_resume_checkbox(ctx);
+        let auto_reconnect = Self::build_auto_reconnect_checkbox(ctx);
+        let mut flx_autoresume = Flex::new(0, 0, GW, ROW_H, "");
+        flx_autoresume.set_type(FlexType::Row);
+        flx_autoresume.end();
+        flx_autoresume.add(&auto_resume);
+        app_col.add(&flx_autoresume);
+        app_col.fixed(&flx_autoresume, ROW_H);
+
+        let mut flx_autoreconnect = Flex::new(0, 0, GW, ROW_H, "");
+        flx_autoreconnect.set_type(FlexType::Row);
+        flx_autoreconnect.end();
+        flx_autoreconnect.add(&auto_reconnect);
+        app_col.add(&flx_autoreconnect);
+        app_col.fixed(&flx_autoreconnect, ROW_H);
+
+        // SlimProto (squeezelite) discovery on/off
+        let enable_slimproto = Self::build_enable_slimproto_checkbox(ctx);
+        let mut flx_enable_slimproto = Flex::new(0, 0, GW, ROW_H, "");
+        flx_enable_slimproto.set_type(FlexType::Row);
+        flx_enable_slimproto.end();
+        flx_enable_slimproto.add(&enable_slimproto);
+        app_col.add(&flx_enable_slimproto);
+        app_col.fixed(&flx_enable_slimproto, ROW_H);
+
+        // RMS animation enable + meters
+        let (show_rms, rms_mon_l, rms_mon_r) = Self::build_rms_monitor_controls(ctx);
         let mut flx_rms = Flex::new(0, 0, GW, ROW_H, "");
         flx_rms.set_type(FlexType::Row);
         flx_rms.end();
@@ -1160,10 +1340,114 @@ impl StatusTab {
                 ssb.set_text(&MainForm::build_status_style(&sb_ref.text()));
             });
         }
-        status_buf.set_text(&MainForm::format_config_status(default_sample_rate));
+        status_buf.set_text(&StatusTab::format_status(default_sample_rate));
         group.add(&status_display);
 
         StatusTab { group }
+    }
+
+    /// build the status tab text from the current config
+    fn format_status(default_sample_rate: u32) -> String {
+        let config = get_config();
+        let bool_icon = |b: bool| if b { "✓" } else { "✗" };
+
+        let audio = config.sound_source.as_deref().unwrap_or("-");
+        let format = config
+            .streaming_format
+            .map_or("lpcm".to_string(), |f| f.to_string());
+        let bits = config.bits_per_sample.unwrap_or(16);
+        let sample_rate = config.sample_rate.unwrap_or(default_sample_rate);
+        let streamsize = config
+            .streaming_format
+            .map_or(StreamSize::U64maxNotChunked, |fmt| {
+                config
+                    .stream_size_for(fmt)
+                    .unwrap_or(StreamSize::NoneChunked)
+            });
+        let buf_ms = config.buffering_delay_msec.unwrap_or(0);
+        let lat_delay_ms = config.latency_reduction_delay_msec.unwrap_or(0);
+        let lat_reduction_ms = config.latency_reduction_msec.unwrap_or(0);
+        let network = config.last_network.as_deref().unwrap_or("-");
+        let port = config.server_port.unwrap_or_default();
+        let ssdp = config.ssdp_interval_mins;
+        let lang = config.language.as_deref().unwrap_or("en-US");
+        let theme = config
+            .color_theme
+            .and_then(|i| THEMES.get(i as usize).copied())
+            .unwrap_or("-");
+        let style = config
+            .widget_scheme
+            .and_then(|i| STYLES.get(i as usize).copied())
+            .unwrap_or("-");
+        let log_level = config.log_level;
+
+        let mut s = String::with_capacity(512);
+        s.push_str(&fl!("audio-source-label", "name" = audio));
+        s.push('\n');
+        let _ = write!(
+            s,
+            "{}  {} bit  {} Hz",
+            fl!("fmt-label", "format" = &format),
+            bits,
+            sample_rate,
+        );
+        if bits == 16 {
+            let _ = write!(
+                s,
+                "  TPDF dither {}",
+                bool_icon(config.use_dither.unwrap_or(true))
+            );
+        }
+        s.push('\n');
+        s.push_str(&fl!("strmsize-label", "size" = streamsize));
+        let _ = writeln!(s, "   buffer: {buf_ms} ms");
+        if lat_reduction_ms > 0 {
+            let _ = writeln!(
+                s,
+                "   latency reduction: {lat_reduction_ms} ms after {lat_delay_ms} ms"
+            );
+        }
+        let _ = writeln!(
+            s,
+            "{}  {}",
+            fl!("chk-inject-silence"),
+            bool_icon(config.inject_silence.unwrap_or(false))
+        );
+        s.push('\n');
+        s.push_str(&fl!("active-network", "addr" = network));
+        s.push('\n');
+        let _ = writeln!(
+            s,
+            "{}  {}   SSDP: {} min",
+            fl!("http-port-label"),
+            port,
+            ssdp
+        );
+        s.push('\n');
+        s.push_str(&fl!("language-label", "lang" = lang));
+        s.push('\n');
+        let _ = writeln!(
+            s,
+            "{}   {}",
+            fl!("color-theme-label", "name" = theme),
+            fl!("widget-style-label", "style" = style)
+        );
+        s.push_str(&fl!("log-level-label", "level" = log_level));
+        s.push('\n');
+        s.push('\n');
+        let _ = writeln!(
+            s,
+            "{}  {}   {}  {}   {}  {}   {}  {}",
+            fl!("chk-autoresume"),
+            bool_icon(config.auto_resume),
+            fl!("chk-autoreconnect"),
+            bool_icon(config.auto_reconnect),
+            fl!("chk-rms-monitor"),
+            bool_icon(config.monitor_rms),
+            fl!("chk-enable-slimproto"),
+            bool_icon(config.enable_slimproto),
+        );
+        s
     }
 }
 
@@ -1487,111 +1771,7 @@ impl MainForm {
     /// refresh the status tab content from the current config
     pub fn refresh_status(&mut self) {
         self.status_buf
-            .set_text(&Self::format_config_status(self.default_sample_rate));
-    }
-
-    /// build the status tab text from the current config
-    fn format_config_status(default_sample_rate: u32) -> String {
-        let config = get_config();
-        let bool_icon = |b: bool| if b { "✓" } else { "✗" };
-
-        let audio = config.sound_source.as_deref().unwrap_or("-");
-        let format = config
-            .streaming_format
-            .map_or("lpcm".to_string(), |f| f.to_string());
-        let bits = config.bits_per_sample.unwrap_or(16);
-        let sample_rate = config.sample_rate.unwrap_or(default_sample_rate);
-        let streamsize = config
-            .streaming_format
-            .map_or(StreamSize::U64maxNotChunked, |fmt| {
-                config
-                    .stream_size_for(fmt)
-                    .unwrap_or(StreamSize::NoneChunked)
-            });
-        let buf_ms = config.buffering_delay_msec.unwrap_or(0);
-        let lat_delay_ms = config.latency_reduction_delay_msec.unwrap_or(0);
-        let lat_reduction_ms = config.latency_reduction_msec.unwrap_or(0);
-        let network = config.last_network.as_deref().unwrap_or("-");
-        let port = config.server_port.unwrap_or_default();
-        let ssdp = config.ssdp_interval_mins;
-        let lang = config.language.as_deref().unwrap_or("en-US");
-        let theme = config
-            .color_theme
-            .and_then(|i| THEMES.get(i as usize).copied())
-            .unwrap_or("-");
-        let style = config
-            .widget_scheme
-            .and_then(|i| STYLES.get(i as usize).copied())
-            .unwrap_or("-");
-        let log_level = config.log_level;
-
-        let mut s = String::with_capacity(512);
-        s.push_str(&fl!("audio-source-label", "name" = audio));
-        s.push('\n');
-        let _ = write!(
-            s,
-            "{}  {} bit  {} Hz",
-            fl!("fmt-label", "format" = &format),
-            bits,
-            sample_rate,
-        );
-        if bits == 16 {
-            let _ = write!(
-                s,
-                "  TPDF dither {}",
-                bool_icon(config.use_dither.unwrap_or(true))
-            );
-        }
-        s.push('\n');
-        s.push_str(&fl!("strmsize-label", "size" = streamsize));
-        let _ = writeln!(s, "   buffer: {buf_ms} ms");
-        if lat_reduction_ms > 0 {
-            let _ = writeln!(
-                s,
-                "   latency reduction: {lat_reduction_ms} ms after {lat_delay_ms} ms"
-            );
-        }
-        let _ = writeln!(
-            s,
-            "{}  {}",
-            fl!("chk-inject-silence"),
-            bool_icon(config.inject_silence.unwrap_or(false))
-        );
-        s.push('\n');
-        s.push_str(&fl!("active-network", "addr" = network));
-        s.push('\n');
-        let _ = writeln!(
-            s,
-            "{}  {}   SSDP: {} min",
-            fl!("http-port-label"),
-            port,
-            ssdp
-        );
-        s.push('\n');
-        s.push_str(&fl!("language-label", "lang" = lang));
-        s.push('\n');
-        let _ = writeln!(
-            s,
-            "{}   {}",
-            fl!("color-theme-label", "name" = theme),
-            fl!("widget-style-label", "style" = style)
-        );
-        s.push_str(&fl!("log-level-label", "level" = log_level));
-        s.push('\n');
-        s.push('\n');
-        let _ = writeln!(
-            s,
-            "{}  {}   {}  {}   {}  {}   {}  {}",
-            fl!("chk-autoresume"),
-            bool_icon(config.auto_resume),
-            fl!("chk-autoreconnect"),
-            bool_icon(config.auto_reconnect),
-            fl!("chk-rms-monitor"),
-            bool_icon(config.monitor_rms),
-            fl!("chk-enable-slimproto"),
-            bool_icon(config.enable_slimproto),
-        );
-        s
+            .set_text(&StatusTab::format_status(self.default_sample_rate));
     }
 
     /// apply a red/green color style to all cross/check marks
