@@ -19,6 +19,7 @@ chk-autoresume = Autom. hervatten
 chk-autoreconnect = Auto-connecteren
 chk-enable-slimproto = SlimProto inschakelen
 ssdp-interval-label = SSDP Interval (in minuten)
+ssdp-interval-tooltip = 0 = UPnP/DLNA-ontdekking uitschakelen (herstart vereist)
 btn-ssdp-discover = SSDP-ontdekking nu uitvoeren
 log-level-label = Log Level: { $level }
 fmt-label = Formaat: { $format }
@@ -32,6 +33,7 @@ strmsize-label = Streamsize: { $size }
 buffer-label = Startbuffer (msec):
 latency-reduction-delay-label = Vertraging latentievermindering (msec):
 latency-reduction-label = hoeveelheid (msec):
+latency-reduction-status-label = Latentievermindering: { $amount } ms na { $delay } ms
 chk-rms-monitor = RMS Monitor
 btn-apply-config = Klik om de wijzigingen toe te passen
 upnp-devices = UPNP toestellen op netwerk { $addr }

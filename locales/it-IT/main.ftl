@@ -19,6 +19,7 @@ chk-autoresume = Ripresa automatica
 chk-autoreconnect = Auto-Riconnessione
 chk-enable-slimproto = Abilita SlimProto
 ssdp-interval-label = Intervallo SSDP (minuti)
+ssdp-interval-tooltip = 0 = disattiva la scoperta UPnP/DLNA (riavvio necessario)
 btn-ssdp-discover = Avvia scoperta SSDP ora
 log-level-label = Log: { $level }
 fmt-label = Format: { $format }
@@ -32,6 +33,7 @@ strmsize-label = DimFlusso: { $size }
 buffer-label = Buffer iniziale (ms):
 latency-reduction-delay-label = Ritardo riduzione latenza (ms):
 latency-reduction-label = quantità (ms):
+latency-reduction-status-label = Riduzione latenza: { $amount } ms dopo { $delay } ms
 chk-rms-monitor = Monitor RMS
 btn-apply-config = Applica modifiche alla configurazione
 upnp-devices = Dispositivi UPNP sulla rete { $addr }

@@ -17,5 +17,5 @@ pub use discovery::{discover, new_agent};
 #[cfg(feature = "gui")]
 pub use types::RendUI;
 pub use types::{
-    AvService, Renderer, StreamInfo, SupportedProtocols, WavData, match_upnp_renderer_index,
+    AvService, Renderer, StreamInfo, SupportedProtocols, WavData, find_matching_upnp_renderer,
 };

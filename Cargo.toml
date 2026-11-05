@@ -13,7 +13,7 @@ authors = [
 ]
 edition = "2024"
 name = "swyh-rs"
-version = "1.21.1"
+version = "1.21.2"
 description = "Stream What You Hear written in Rust"
 license = "MIT"
 repository = "https://github.com/dheijl/swyh-rs/"
@@ -71,7 +71,7 @@ htmlescape = "0.3.1"
 if-addrs = "0.15.0"
 lexopt = "0.3.2"
 local-ip-address = { version = "0.6.13", optional = true }
-log = { version = "0.4.34", features = [
+log = { version = "0.4.35", features = [
     "max_level_trace",
     "release_max_level_debug",
     "serde",
@@ -81,9 +81,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 socket2 = "0.6.5"
 simplelog = { version = "0.12.2", features = ["local-offset"] }
 sys-locale = "0.3"
-tiny_http_dh = { version = "0.12.2" }
-toml = "1.1.8"
-ureq = { version = "3.5.0", default-features = false, features = [
+tiny_http_dh = { version = "0.12.3" }
+toml = "1.2.0"
+ureq = { version = "3.5.1", default-features = false, features = [
     "charset",
     "gzip",
 ] }
@@ -102,7 +102,7 @@ winres = "0.1.12"
 [target.'cfg(unix)'.dependencies]
 fltk = { version = "1.5.23", features = ["use-ninja"], optional = true }
 fltk-theme = { version = "0.7.9", optional = true }
-rustix = { version = "1.1.5", default-features = false, features = ["process"] }
+rustix = { version = "1.1.6", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -114,11 +114,11 @@ name = "samples_conv"
 harness = false
 
 [patch.crates-io]
-zmij = { git = "https://github.com/dtolnay/zmij" }
+#zmij = { git = "https://github.com/dtolnay/zmij" }
 #figura = { git = "https://github.com/dheijl/figura_dh" }
 #fltk = { git = "https://github.com/fltk-rs/fltk-rs" }
 #tiny_http = { git = "https://github.com/dheijl/tiny-http-dh" }
-cpal = { git = "https://github.com/RustAudio/cpal.git", branch = "stable-0.18" }
+#cpal = { git = "https://github.com/RustAudio/cpal.git", branch = "stable-0.18" }
 #cpal = { git = "https://github.com/RustAudio/cpal.git" }
 #flac-bound = { git = "https://github.com/dheijl/flac-bound" }
 #flac-bound = { git = "https://github.com/nabijaczleweli/flac-bound" }

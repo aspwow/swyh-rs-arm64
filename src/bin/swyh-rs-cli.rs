@@ -37,10 +37,12 @@ use swyh_rs::{
     },
     enums::{messages::MessageType, streaming::StreamingState},
     fl,
-    globals::statics::{
-        APP_DATE, APP_VERSION, ONE_MINUTE, SERVER_PORT, THREAD_STACK, get_clients, get_config_mut,
-        get_msgchannel, get_renderers, get_renderers_mut, get_slim_renderers,
-        get_slim_renderers_mut, stop_clients_by_ip,
+    globals::{
+        RendererKind,
+        statics::{
+            APP_DATE, APP_VERSION, ONE_MINUTE, SERVER_PORT, THREAD_STACK, get_clients,
+            get_config_mut, get_msgchannel, get_renderers, get_renderers_mut, stop_clients_by_ip,
+        },
     },
     rendercontrol::{Renderer, StreamInfo, WavData, discover, new_agent},
     server::streaming_server::run_server,
@@ -72,8 +74,14 @@ fn main() -> Result<(), i32> {
             eprintln!("Argument error: {e}");
         }
         args.usage();
+        println!("{args:?}\n");
         return Err(1);
     }
+    if args.help {
+        args.usage();
+        return Ok(());
+    }
+    println!("{args:?}\n");
     // first initialize cpal audio to prevent COM reinitialize panic on Windows
     // but it's possible that there is no default audio device
     let audio_output_device_opt = get_default_audio_output_device();
@@ -269,11 +277,14 @@ fn main() -> Result<(), i32> {
         );
     } else {
         for ip in &config.active_renderers {
-            if let Some(pl) = get_renderers()
+            // clone the renderer out so the RENDERERS read lock is released
+            // before the blocking SOAP calls below
+            if let Some(mut player) = get_renderers()
                 .iter()
+                .filter_map(RendererKind::as_upnp)
                 .find(|&renderer| renderer.controller.remote_addr == *ip)
+                .cloned()
             {
-                let mut player = pl.clone();
                 if let Some(vol) = args.volume
                     && player.volume > -1
                 {
@@ -304,7 +315,7 @@ fn main() -> Result<(), i32> {
                                 "addr" = &newr.controller.remote_addr
                             ),
                         );
-                        get_renderers_mut().push(*newr);
+                        get_renderers_mut().push(RendererKind::Upnp(*newr));
                     }
                 }
                 // a SlimProto (squeezelite) client sent its HELO handshake:
@@ -331,7 +342,7 @@ fn main() -> Result<(), i32> {
                                 newr.remote_addr
                             ),
                         );
-                        newr.player_index = get_slim_renderers().len();
+                        newr.player_index = get_renderers().len();
                         if !serve_only
                             && config
                                 .active_renderers
@@ -362,7 +373,7 @@ fn main() -> Result<(), i32> {
                                 );
                             }
                         }
-                        get_slim_renderers_mut().push(*newr);
+                        get_renderers_mut().push(RendererKind::Slim(*newr));
                     }
                 }
                 // a SlimProto client's TCP control connection dropped; force-drop
@@ -379,8 +390,9 @@ fn main() -> Result<(), i32> {
                         &format!("SlimProto client {remote_addr} disconnected"),
                     );
                     stop_clients_by_ip(&remote_addr, true);
-                    if let Some(r) = get_slim_renderers_mut()
+                    if let Some(r) = get_renderers_mut()
                         .iter_mut()
+                        .filter_map(RendererKind::as_slim_mut)
                         .find(|r| r.remote_addr == remote_addr && r.peer_port == peer_port)
                     {
                         r.playing = false;
@@ -405,6 +417,7 @@ fn main() -> Result<(), i32> {
                             // doesn't stall the global RENDERERS lock for other threads
                             let renderer = get_renderers()
                                 .iter()
+                                .filter_map(RendererKind::as_upnp)
                                 .find(|r| r.controller.remote_addr == streamer_feedback.remote_ip)
                                 .cloned();
                             if let Some(mut r) = renderer {
@@ -470,10 +483,7 @@ fn main() -> Result<(), i32> {
 fn sync_config(config: &Configuration) {
     let _ = config.update_config();
     // update in-memory shared config for other threads
-    {
-        let mut conf = get_config_mut();
-        *conf = config.clone();
-    }
+    *get_config_mut() = config.clone();
 }
 
 /// configure simplelog with both terminal and file sinks
@@ -530,8 +540,7 @@ fn resolve_selected_index(
     let name_matches: Vec<_> = device_names
         .iter()
         .enumerate()
-        .filter(|(_, name)| name.as_str() == config_sound_source)
-        .map(|(index, _)| index)
+        .filter_map(|(index, name)| (name.as_str() == config_sound_source).then_some(index))
         .collect();
     match name_matches.as_slice() {
         [unique_index] => *unique_index,
@@ -845,6 +854,7 @@ fn wanted_players_discovered(args: &Args, last_renderer: Option<&str>) -> bool {
     let discovered = |id: &str| {
         renderers
             .iter()
+            .filter_map(RendererKind::as_upnp)
             .any(|r| r.controller.remote_addr == id || r.controller.dev_name.contains(id))
     };
 
@@ -877,7 +887,7 @@ fn resolve_player_names(
     loop {
         while let Ok(msg) = msg_rx.try_recv() {
             if let MessageType::SsdpMessage(newr) = msg {
-                get_renderers_mut().push(*newr.clone());
+                get_renderers_mut().push(RendererKind::Upnp(*newr.clone()));
                 ui_log(
                     LogCategory::Info,
                     &fl!(
@@ -897,36 +907,32 @@ fn resolve_player_names(
     }
     // resolve player name to IP address if a name was given instead of an IP
     if let Some(ref pl_ip) = args.player_ip
-        && let Some(r) = get_renderers()
+        && let Some(addr) = get_renderers()
             .iter()
+            .filter_map(RendererKind::as_upnp)
             .find(|r| r.controller.dev_name.contains(pl_ip))
+            .map(|r| r.controller.remote_addr.to_string())
     {
         ui_log(
             LogCategory::Info,
-            &fl!(
-                "cli-default-renderer-ip",
-                "ip" = pl_ip,
-                "addr" = &r.controller.remote_addr
-            ),
+            &fl!("cli-default-renderer-ip", "ip" = pl_ip, "addr" = &addr),
         );
-        args.player_ip = Some(r.controller.remote_addr.to_string());
+        args.player_ip = Some(addr);
     }
     if let Some(active_players) = &args.active_players {
         let mut ip_players: Vec<String> = Vec::new();
         active_players.iter().for_each(|ap| {
-            if let Some(r) = get_renderers()
+            if let Some(addr) = get_renderers()
                 .iter()
+                .filter_map(RendererKind::as_upnp)
                 .find(|r| r.controller.dev_name.contains(ap))
+                .map(|r| r.controller.remote_addr.to_string())
             {
-                ip_players.push(r.controller.remote_addr.to_string());
                 ui_log(
                     LogCategory::Info,
-                    &fl!(
-                        "cli-active-renderer",
-                        "name" = ap,
-                        "addr" = &r.controller.remote_addr
-                    ),
+                    &fl!("cli-active-renderer", "name" = ap, "addr" = &addr),
                 );
+                ip_players.push(addr);
             }
         });
         if !ip_players.is_empty() {
@@ -946,13 +952,15 @@ fn select_primary_renderer(config: &Configuration) -> Option<Renderer> {
     let last_renderer = config.last_renderer.as_deref().unwrap_or("");
     if let Some(pl) = get_renderers()
         .iter()
+        .filter_map(RendererKind::as_upnp)
         .find(|r| r.controller.remote_addr == last_renderer)
+        .cloned()
     {
         ui_log(
             LogCategory::Info,
             &fl!("cli-default-player-ip", "ip" = &pl.controller.remote_addr),
         );
-        return Some(pl.clone());
+        return Some(pl);
     }
     if config.enable_slimproto {
         info!(
@@ -968,8 +976,9 @@ fn select_primary_renderer(config: &Configuration) -> Option<Renderer> {
 /// stop all playing renderers, wait for HTTP connections to drain, then exit
 fn shutdown_ctrlc(serve_only: bool, player: Option<&Renderer>, playing: Vec<Renderer>) -> ! {
     println!("{}", fl!("cli-received-ctrlc"));
-    let slim_playing: Vec<_> = get_slim_renderers()
+    let slim_playing: Vec<_> = get_renderers()
         .iter()
+        .filter_map(RendererKind::as_slim)
         .filter(|r| r.playing)
         .cloned()
         .collect();

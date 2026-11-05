@@ -19,12 +19,15 @@ use swyh_rs::{
     },
     enums::{messages::MessageType, streaming::StreamingState},
     fl,
-    globals::statics::{
-        APP_DATE, APP_VERSION, SERVER_PORT, THREAD_STACK, get_clients, get_config_mut,
-        get_msgchannel, get_renderers, get_renderers_mut, get_slim_renderers,
-        get_slim_renderers_mut, stop_clients_by_ip,
+    globals::{
+        RendererKind,
+        statics::{
+            APP_DATE, APP_VERSION, SERVER_PORT, THREAD_STACK, get_clients, get_config_mut,
+            get_msgchannel, get_renderers, get_renderers_mut, stop_clients_by_ip,
+            update_config_with,
+        },
     },
-    rendercontrol::{StreamInfo, WavData, match_upnp_renderer_index},
+    rendercontrol::{StreamInfo, WavData, find_matching_upnp_renderer},
     server::streaming_server::{StreamerFeedBack, run_server},
     ui::mainform::MainForm,
     utils::{
@@ -54,6 +57,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::Path,
     rc::Rc,
+    sync::atomic::Ordering,
     thread::{self},
     time::Duration,
 };
@@ -278,14 +282,15 @@ fn main() {
                     // racy) message got processed — a stale notification
                     // for the old, now-superseded connection must not clear
                     // state that belongs to the new one
-                    let button = get_slim_renderers_mut()
+                    let button = get_renderers_mut()
                         .iter_mut()
+                        .filter_map(RendererKind::as_slim_mut)
                         .find(|r| r.remote_addr == remote_addr && r.peer_port == peer_port)
-                        .map(|r| {
+                        .and_then(|r| {
                             r.playing = false;
                             r.rend_ui.button.clone()
                         });
-                    if let Some(Some(mut button)) = button {
+                    if let Some(mut button) = button {
                         button.set(false);
                     }
                 }
@@ -301,13 +306,14 @@ fn main() {
                             LogCategory::Error,
                             &format!("Failed to start playing on {}: {e}", outcome.remote_addr),
                         );
-                        update_playstate(&outcome.remote_addr, false);
-                        let button = get_renderers()
-                            .iter()
-                            .find(|r| r.controller.remote_addr == outcome.remote_addr)
-                            .and_then(|r| r.rend_ui.button.clone());
-                        if let Some(mut button) = button {
-                            button.set(false);
+                        // check for ambiguous/absent UPnP match — see `find_matching_upnp_renderer`.
+                        if let Some(renderer) =
+                            find_matching_upnp_renderer(&get_renderers(), &outcome.remote_addr)
+                        {
+                            renderer.playing.store(false, Ordering::Relaxed);
+                            if let Some(mut button) = renderer.rend_ui.button.clone() {
+                                button.set(false);
+                            }
                         }
                     }
                 }
@@ -356,16 +362,6 @@ fn main() {
     } // while app::wait()
 
     shutdown_and_exit();
-}
-
-/// update the playstate for the renderer with this ip address
-fn update_playstate(remote_addr: &str, playing: bool) {
-    if let Some(r) = get_renderers_mut()
-        .iter_mut()
-        .find(|r| r.controller.remote_addr == remote_addr)
-    {
-        r.playing = playing;
-    }
 }
 
 /// configure simplelog to write to file (and terminal in debug/Linux builds)
@@ -662,29 +658,21 @@ fn handle_player_message(
 ) {
     // A device that exposes both a UPnP renderer and a SlimProto client at
     // the same IP (e.g. MoOde) can trigger this feedback via either path.
-    // `streamer_feedback.is_slim` tells us precisely which one this is, so
-    // route SlimProto's own feedback (or an ambiguous/absent UPnP match —
-    // see `match_upnp_renderer_index`) away from the UPnP button/state below.
-    let renderers = get_renderers();
-    let ips: Vec<String> = renderers
-        .iter()
-        .map(|r| r.controller.remote_addr.to_string())
-        .collect();
-    let Some(idx) = match_upnp_renderer_index(
-        streamer_feedback.is_slim,
-        &streamer_feedback.remote_ip,
-        ips.iter().map(String::as_str),
-    ) else {
+    if streamer_feedback.is_slim {
+        return;
+    }
+    // check for ambiguous/absent UPnP match — see `find_matching_upnp_renderer`.
+    let Some(renderer) =
+        find_matching_upnp_renderer(&get_renderers(), &streamer_feedback.remote_ip)
+    else {
         return;
     };
-    let renderer = renderers[idx].clone();
-    drop(renderers); // release the RENDERERS read lock before further work
     let Some(mut button) = renderer.rend_ui.button.clone() else {
         return;
     };
     match streamer_feedback.streaming_state {
         StreamingState::Started => {
-            update_playstate(&streamer_feedback.remote_ip, true);
+            renderer.playing.store(true, Ordering::Relaxed);
             button.set(true);
         }
         StreamingState::Ended => {
@@ -695,13 +683,13 @@ fn handle_player_message(
             });
             if still_streaming {
                 button.set(true);
-                update_playstate(&streamer_feedback.remote_ip, true);
+                renderer.playing.store(true, Ordering::Relaxed);
             } else {
-                update_playstate(&streamer_feedback.remote_ip, false);
+                renderer.playing.store(false, Ordering::Relaxed);
                 if auto_resume && button.is_set() {
                     let streaminfo = StreamInfo::new(wd.sample_rate);
                     renderer.spawn_play(*local_addr, streaminfo);
-                    update_playstate(&streamer_feedback.remote_ip, true);
+                    renderer.playing.store(true, Ordering::Relaxed);
                 } else {
                     button.set(false);
                 }
@@ -715,52 +703,51 @@ fn handle_player_message(
 fn shutdown_and_exit() {
     let mut active_players: Vec<String> = Vec::new();
     let renderers = get_renderers().clone();
-    for mut renderer in renderers {
-        if let Some(button) = renderer.rend_ui.button.as_ref()
-            && button.is_set()
-        {
-            ui_log(
-                LogCategory::Info,
-                &fl!(
-                    "status-shutting-down",
-                    "name" = &renderer.controller.dev_name
-                ),
-            );
-            app::redraw();
-            active_players.push(renderer.controller.remote_addr.to_string());
-            renderer.stop_play();
-            app::redraw();
-        }
-    }
-    let slim_renderers = get_slim_renderers().clone();
-    for renderer in slim_renderers {
-        if let Some(button) = renderer.rend_ui.button.as_ref()
-            && button.is_set()
-        {
-            ui_log(
-                LogCategory::Info,
-                &format!("Shutting down SlimProto renderer {}", renderer.remote_addr),
-            );
-            app::redraw();
-            active_players.push(renderer.remote_addr.to_string());
-            if let Err(e) = renderer.send_strm_stop() {
-                ui_log(
-                    LogCategory::Error,
-                    &format!(
-                        "SlimProto: failed to stop playback on {}: {e}",
-                        renderer.remote_addr
-                    ),
-                );
+    for renderer in renderers {
+        match renderer {
+            RendererKind::Upnp(mut renderer) => {
+                if let Some(button) = renderer.rend_ui.button.as_ref()
+                    && button.is_set()
+                {
+                    ui_log(
+                        LogCategory::Info,
+                        &fl!(
+                            "status-shutting-down",
+                            "name" = &renderer.controller.dev_name
+                        ),
+                    );
+                    app::redraw();
+                    active_players.push(renderer.controller.remote_addr.to_string());
+                    renderer.stop_play();
+                    app::redraw();
+                }
             }
-            app::redraw();
+            RendererKind::Slim(renderer) => {
+                if let Some(button) = renderer.rend_ui.button.as_ref()
+                    && button.is_set()
+                {
+                    ui_log(
+                        LogCategory::Info,
+                        &format!("Shutting down SlimProto renderer {}", renderer.remote_addr),
+                    );
+                    app::redraw();
+                    active_players.push(renderer.remote_addr.to_string());
+                    if let Err(e) = renderer.send_strm_stop() {
+                        ui_log(
+                            LogCategory::Error,
+                            &format!(
+                                "SlimProto: failed to stop playback on {}: {e}",
+                                renderer.remote_addr
+                            ),
+                        );
+                    }
+                    app::redraw();
+                }
+            }
         }
     }
     // remember active players in config for auto_reconnect
-    {
-        let mut config = get_config_mut();
-        config.active_renderers = active_players;
-        let _ = config.update_config();
-    }
+    update_config_with(|c| c.active_renderers = active_players);
     // wait for HTTP streaming connections to drain
     for _ in 0..50 {
         if get_clients().is_empty() {

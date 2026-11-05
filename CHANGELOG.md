@@ -1,6 +1,14 @@
 # swyh-rs Changelog
 
-- 1.21.1 (unreleased)
+- 1.21.2 (unreleased)
+  - CLI: fix Readme for -D option and exit on -h
+  - flacstream: greatly simplify the faint white noise generator (used when inject silence is not active in the absence of audio).
+
+- 1.21.1 (Nov 2 2026, dheijl)
+  - GUI: add a tooltip for ssdp-interval = 0 disabling UPNP discvovery, and add a scrollbar (if needed) to the renderers box (issue #309). Added with the assistance of Claude.
+  - bugfix: RMS monitor checkbox (p)ushed down off the App tab) visible again
+  - refactor: replace handwritten (Claude, unsafe) simd code with the safe equivalents from the wide crate, much cleaner and same performance
+  - refactor: merge UPnP and SlimProto renderer lists into one list of RenderKind enum and some other minor refactoring
   - refactor ui code
   - small optimization in RMS computation
   - audio capture now supports CPAL I24 and U24 sample formats too
@@ -17,6 +25,8 @@
   - tiny http is replaced by tiny_http_dh, my fork of tiny_http. It is upgraded to the latest Rust compiler, Rust 2024, has some cherrypicked PRs from tiny_http, and two CVE issue fixes.
   - limit the tiny_http thread/task pool using the new `_with_pool()` method.
   - update CI with caching, fmt, and tests (thanks Claude).
+  - fix(server): disambiguate UPnP vs SlimProto renderer feedback when both share the same IP (e.g. a SqueezeLite client running on the same box as a UPnP renderer, like a dual-endpoint MoOde setup).
+  - test(config): more Configuration tests
 
 - 1.21.0 (Aug 23 2026, dheijl)
   - don't report underrun errors in the GUI but log them

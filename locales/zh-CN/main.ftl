@@ -19,6 +19,7 @@ chk-autoresume = 自动恢复播放
 chk-autoreconnect = 自动重连
 chk-enable-slimproto = 启用 SlimProto
 ssdp-interval-label = SSDP 间隔（分钟）
+ssdp-interval-tooltip = 0 = 禁用 UPnP/DLNA 发现（需要重启）
 btn-ssdp-discover = 立即运行 SSDP 发现
 log-level-label = 日志级别：{ $level }
 fmt-label = 格式：{ $format }
@@ -32,6 +33,7 @@ strmsize-label = 流大小：{ $size }
 buffer-label = 初始缓冲区（毫秒）：
 latency-reduction-delay-label = 延迟缩减等待时间（毫秒）：
 latency-reduction-label = 数量（毫秒）：
+latency-reduction-status-label = 延迟缩减：{ $delay } 毫秒后缩减 { $amount } 毫秒
 chk-rms-monitor = RMS 监视器
 btn-apply-config = 点击应用配置更改
 upnp-devices = 网络 { $addr } 上的 UPNP 渲染设备

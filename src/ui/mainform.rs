@@ -11,10 +11,12 @@ use crate::{
         StreamingFormat::{self},
     },
     fl,
-    globals::statics::{
-        APP_DATE, APP_VERSION, NSTYLES, NTHEMES, RUN_RMS_MONITOR, SAMPLE_RATES, STYLES, THEMES,
-        get_config, get_config_mut, get_renderers, get_renderers_mut, get_slim_renderers,
-        get_slim_renderers_mut,
+    globals::{
+        RendererKind,
+        statics::{
+            APP_DATE, APP_VERSION, NSTYLES, NTHEMES, RUN_RMS_MONITOR, SAMPLE_RATES, STYLES, THEMES,
+            get_config, get_renderers, get_renderers_mut, update_config_with,
+        },
     },
     rendercontrol::{Renderer, StreamInfo, WavData},
     slimproto::types::SlimRenderer,
@@ -25,7 +27,7 @@ use fltk::{
     button::{Button, CheckButton, LightButton},
     enums::{self, Align, Color, Event, FrameType},
     frame::Frame,
-    group::{Flex, FlexType, Group, Pack, PackType, Tabs},
+    group::{Flex, FlexType, Group, Pack, PackType, Scroll, ScrollType, Tabs},
     image::SvgImage,
     input::IntInput,
     menu::Choice,
@@ -128,11 +130,15 @@ pub struct MainForm {
     bwidth: i32,
     bheight: i32,
     renderer_pack: Pack,
+    /// vertical-only scroll area around `renderer_pack`, sized by [`Self::fit_to_window`]
+    renderer_scroll: Scroll,
     wd: WavData,
     default_sample_rate: u32,
     local_addr: IpAddr,
+    /// index of the next renderer button in the merged UPnP+SlimProto
+    /// `RENDERERS` list, shared by both [`Self::add_renderer_button`] and
+    /// [`Self::add_slim_renderer_button`] since both push onto that one list
     player_index: usize,
-    slim_player_index: usize,
     config_changed: Rc<Cell<bool>>,
     /// running line count of `tb`'s buffer, kept in sync by `add_log_msg`
     log_lines: i32,
@@ -147,12 +153,19 @@ const TAB_BAR_H: i32 = 30;
 const INNER_H: i32 = TAB_H - TAB_BAR_H;
 const ROW_SPACING: i32 = 5;
 const MARGIN: i32 = 5;
-/// floor for the feedback log box height once [`MainForm::clamp_feedback_height`]
-/// starts shrinking it to keep it inside the window
-const MIN_FEEDBACK_H: i32 = 60;
-/// height the feedback log box is constructed with, and the ceiling
-/// [`MainForm::clamp_feedback_height`] grows it back to when there's room
+/// floor for the feedback log box height once [`MainForm::fit_to_window`]
+/// starts shrinking it to keep it inside the window: 5 lines of 12pt text
+/// (~14px each), plus room for its horizontal scrollbar and frame
+const MIN_FEEDBACK_H: i32 = 5 * 14 + 16 + 6;
+/// height the feedback log box is constructed with
 const PREFERRED_FEEDBACK_H: i32 = 296;
+/// spacing between the rows of the main vertical pack
+const VPACK_SPACING: i32 = 15;
+/// spacing between the renderer button rows
+const RENDERER_SPACING: i32 = 15;
+/// the renderer scroll area never shrinks below 2 button rows (if there are that many),
+/// even if that pushes the feedback box partly out of a very small window
+const MIN_RENDERER_AREA_H: i32 = 2 * ROW_H + RENDERER_SPACING;
 const LABEL_W: i32 = 130;
 const LABEL_W_NET: i32 = 179;
 
@@ -243,12 +256,10 @@ impl AudioTab {
                     LogCategory::Info,
                     &fl!("warn-audio-changed", "name" = &name),
                 );
-                {
-                    let mut conf = get_config_mut();
-                    conf.sound_source = Some(name);
-                    conf.sound_source_index = Some(index);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| {
+                    c.sound_source = Some(name);
+                    c.sound_source_index = Some(index);
+                });
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -286,11 +297,7 @@ impl AudioTab {
                     LogCategory::Info,
                     &fl!("info-format-changed", "format" = &format),
                 );
-                {
-                    let mut conf = get_config_mut();
-                    conf.streaming_format = Some(newformat);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.streaming_format = Some(newformat));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -334,13 +341,11 @@ impl AudioTab {
                 if current == Some(streamsize) {
                     return;
                 }
-                let streaming_format = {
-                    let mut conf = get_config_mut();
-                    let fmt = conf.streaming_format.unwrap_or(StreamingFormat::Flac);
-                    conf.set_stream_size_for(fmt, streamsize);
-                    let _ = conf.update_config();
-                    conf.streaming_format.unwrap()
-                };
+                let streaming_format = update_config_with(|c| {
+                    let fmt = c.streaming_format.unwrap_or(StreamingFormat::Flac);
+                    c.set_stream_size_for(fmt, streamsize);
+                    fmt
+                });
                 ui_log(
                     LogCategory::Info,
                     &fl!(
@@ -382,11 +387,7 @@ impl AudioTab {
                 if get_config().use_dither == Some(is_set) {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.use_dither = Some(is_set);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.use_dither = Some(is_set));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -398,19 +399,17 @@ impl AudioTab {
                 if get_config().bits_per_sample == Some(new_bits) {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
+                update_config_with(|c| {
                     if b.is_set() {
-                        conf.bits_per_sample = Some(24);
+                        c.bits_per_sample = Some(24);
                         use_dither_ref.set(false);
                         use_dither_ref.deactivate();
                     } else {
-                        conf.bits_per_sample = Some(16);
+                        c.bits_per_sample = Some(16);
                         use_dither_ref.activate();
-                        use_dither_ref.set(conf.use_dither.unwrap_or(true));
+                        use_dither_ref.set(c.use_dither.unwrap_or(true));
                     }
-                    let _ = conf.update_config();
-                }
+                });
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -448,11 +447,7 @@ impl AudioTab {
                 if get_config().sample_rate == new_rate {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.sample_rate = new_rate;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.sample_rate = new_rate);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -478,11 +473,7 @@ impl AudioTab {
                 if get_config().inject_silence == Some(is_set) {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.inject_silence = Some(is_set);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.inject_silence = Some(is_set));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -512,11 +503,7 @@ impl AudioTab {
                     b = 5_000;
                 }
                 if b as u32 != b_config {
-                    {
-                        let mut conf = get_config_mut();
-                        conf.buffering_delay_msec = Some(b as u32);
-                        let _ = conf.update_config();
-                    }
+                    update_config_with(|c| c.buffering_delay_msec = Some(b as u32));
                     sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
@@ -546,11 +533,7 @@ impl AudioTab {
                     d = 5_000;
                 }
                 if d as u32 != lat_delay_config {
-                    {
-                        let mut conf = get_config_mut();
-                        conf.latency_reduction_delay_msec = Some(d as u32);
-                        let _ = conf.update_config();
-                    }
+                    update_config_with(|c| c.latency_reduction_delay_msec = Some(d as u32));
                     sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
@@ -580,11 +563,7 @@ impl AudioTab {
                     l = 5_000;
                 }
                 if l as u32 != lat_amount_config {
-                    {
-                        let mut conf = get_config_mut();
-                        conf.latency_reduction_msec = Some(l as u32);
-                        let _ = conf.update_config();
-                    }
+                    update_config_with(|c| c.latency_reduction_msec = Some(l as u32));
                     sb.set_text(&StatusTab::format_status(default_sample_rate));
                 }
             }
@@ -738,11 +717,7 @@ impl NetworkTab {
                     LogCategory::Info,
                     &fl!("warn-network-changed", "name" = &name),
                 );
-                {
-                    let mut conf = get_config_mut();
-                    conf.last_network = Some(name);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.last_network = Some(name));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -767,11 +742,7 @@ impl NetworkTab {
                     return;
                 }
                 if new_value as u16 != get_config().server_port.unwrap_or_default() {
-                    {
-                        let mut conf = get_config_mut();
-                        conf.server_port = Some(new_value as u16);
-                        let _ = conf.update_config();
-                    }
+                    update_config_with(|c| c.server_port = Some(new_value as u16));
                     sb.set_text(&StatusTab::format_status(default_sample_rate));
                     config_changed.set(true);
                 }
@@ -787,6 +758,7 @@ impl NetworkTab {
 
         let mut ssdp_interval = Counter::new(0, 0, 0, 0, "");
         ssdp_interval.set_value(config.ssdp_interval_mins);
+        ssdp_interval.set_tooltip(&fl!("ssdp-interval-tooltip"));
         ssdp_interval.handle({
             let config_changed = ctx.config_changed.clone();
             let mut sb = ctx.status_buf.clone();
@@ -800,16 +772,10 @@ impl NetworkTab {
                             _ => b.value(),
                         };
                         b.set_value(v);
-                        let mut ssdp_interval_mins: f64 = -1.0;
-                        {
-                            let mut conf = get_config_mut();
-                            if (conf.ssdp_interval_mins - b.value()).abs() > 0.09 {
-                                conf.ssdp_interval_mins = b.value();
-                                ssdp_interval_mins = conf.ssdp_interval_mins;
-                                let _ = conf.update_config();
-                            }
-                        }
-                        if ssdp_interval_mins >= 0.0 {
+                        let ssdp_interval_mins = b.value();
+                        // the read guard in the `if` condition is dropped before the body runs
+                        if (get_config().ssdp_interval_mins - ssdp_interval_mins).abs() > 0.09 {
+                            update_config_with(|c| c.ssdp_interval_mins = ssdp_interval_mins);
                             ui_log(
                                 LogCategory::Warning,
                                 &fl!("warn-ssdp-changed", "interval" = ssdp_interval_mins),
@@ -930,11 +896,7 @@ impl AppTab {
                     LogCategory::Warning,
                     &fl!("warn-language-changed", "lang" = &lang),
                 );
-                {
-                    let mut conf = get_config_mut();
-                    conf.language = Some(lang);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.language = Some(lang));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -968,11 +930,7 @@ impl AppTab {
                 }
                 let name = MainForm::apply_theme(b.value() as usize);
                 debug!("New theme = {name}");
-                {
-                    let mut conf = get_config_mut();
-                    conf.color_theme = Some(new_theme);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.color_theme = Some(new_theme));
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -1009,11 +967,7 @@ impl AppTab {
                     return;
                 }
                 let name = STYLES[b.value() as usize];
-                {
-                    let mut conf = get_config_mut();
-                    conf.widget_scheme = Some(new_style);
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.widget_scheme = Some(new_style));
                 ui_log(
                     LogCategory::Warning,
                     &fl!("warn-widget-style-changed", "style" = name),
@@ -1057,11 +1011,7 @@ impl AppTab {
                     LogCategory::Warning,
                     &fl!("warn-log-changed", "level" = level),
                 );
-                {
-                    let mut conf = get_config_mut();
-                    conf.log_level = loglevel;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.log_level = loglevel);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -1086,11 +1036,7 @@ impl AppTab {
                 if get_config().auto_resume == is_set {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.auto_resume = is_set;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.auto_resume = is_set);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -1114,11 +1060,7 @@ impl AppTab {
                 if get_config().auto_reconnect == is_set {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.auto_reconnect = is_set;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.auto_reconnect = is_set);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -1146,11 +1088,7 @@ impl AppTab {
                     return;
                 }
                 ui_log(LogCategory::Warning, &fl!("warn-slimproto-changed"));
-                {
-                    let mut conf = get_config_mut();
-                    conf.enable_slimproto = is_set;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.enable_slimproto = is_set);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
                 config_changed.set(true);
             }
@@ -1193,11 +1131,7 @@ impl AppTab {
                 if get_config().monitor_rms == run_rms {
                     return;
                 }
-                {
-                    let mut conf = get_config_mut();
-                    conf.monitor_rms = run_rms;
-                    let _ = conf.update_config();
-                }
+                update_config_with(|c| c.monitor_rms = run_rms);
                 sb.set_text(&StatusTab::format_status(default_sample_rate));
             }
         });
@@ -1257,15 +1191,9 @@ impl AppTab {
         flx_autoresume.set_type(FlexType::Row);
         flx_autoresume.end();
         flx_autoresume.add(&auto_resume);
+        flx_autoresume.add(&auto_reconnect);
         app_col.add(&flx_autoresume);
         app_col.fixed(&flx_autoresume, ROW_H);
-
-        let mut flx_autoreconnect = Flex::new(0, 0, GW, ROW_H, "");
-        flx_autoreconnect.set_type(FlexType::Row);
-        flx_autoreconnect.end();
-        flx_autoreconnect.add(&auto_reconnect);
-        app_col.add(&flx_autoreconnect);
-        app_col.fixed(&flx_autoreconnect, ROW_H);
 
         // SlimProto (squeezelite) discovery on/off
         let enable_slimproto = Self::build_enable_slimproto_checkbox(ctx);
@@ -1401,17 +1329,20 @@ impl StatusTab {
         s.push('\n');
         s.push_str(&fl!("strmsize-label", "size" = streamsize));
         let _ = writeln!(s, "   buffer: {buf_ms} ms");
-        if lat_reduction_ms > 0 {
-            let _ = writeln!(
-                s,
-                "   latency reduction: {lat_reduction_ms} ms after {lat_delay_ms} ms"
-            );
-        }
-        let _ = writeln!(
+        let _ = write!(
             s,
             "{}  {}",
             fl!("chk-inject-silence"),
             bool_icon(config.inject_silence.unwrap_or(false))
+        );
+        let _ = writeln!(
+            s,
+            "   {}",
+            fl!(
+                "latency-reduction-status-label",
+                "amount" = lat_reduction_ms,
+                "delay" = lat_delay_ms
+            )
         );
         s.push('\n');
         s.push_str(&fl!("active-network", "addr" = network));
@@ -1456,6 +1387,83 @@ fn feedback_target_height(window_h: i32, feedback_y: i32) -> i32 {
     (window_h - feedback_y).max(MIN_FEEDBACK_H)
 }
 
+/// total height of rows stacked with `spacing` between them, as `Fl_Pack` lays them out
+fn stacked_height(heights: impl IntoIterator<Item = i32>, spacing: i32) -> i32 {
+    let (sum, n) = heights
+        .into_iter()
+        .fold((0, 0), |(sum, n), h| (sum + h, n + 1));
+    if n == 0 { 0 } else { sum + spacing * (n - 1) }
+}
+
+/// height for the renderer scroll area: fit all the buttons if they fit, otherwise
+/// whatever is left above a minimum-height feedback box (but at least 2 rows)
+fn renderer_area_height(window_h: i32, area_y: i32, content_h: i32) -> i32 {
+    let available = window_h - area_y - VPACK_SPACING - MIN_FEEDBACK_H;
+    content_h.min(available.max(MIN_RENDERER_AREA_H))
+}
+
+/// `Fl_Scroll` never resizes its children, so make the renderer pack follow the scroll
+/// area's width, minus the vertical scrollbar when the buttons don't all fit
+fn fit_pack_width(scroll: &Scroll, pack: &mut Pack) {
+    let pack_w = if pack.h() > scroll.h() {
+        scroll.w() - app::scrollbar_size()
+    } else {
+        scroll.w()
+    };
+    if pack.w() != pack_w {
+        pack.resize(pack.x(), pack.y(), pack_w, pack.h());
+    }
+}
+
+/// Size the renderer scroll area and the feedback box below it to the window height.
+/// Relies on `vpack` having positioned `scroll` (i.e. on a previous draw).
+/// Returns true if anything was resized.
+fn fit_bottom_to_window(
+    window_h: i32,
+    scroll: &mut Scroll,
+    pack: &mut Pack,
+    feedback: &mut Flex,
+) -> bool {
+    let mut changed = false;
+    let feedback_y = if scroll.visible() {
+        let content_h = stacked_height(
+            (0..pack.children())
+                .filter_map(|i| pack.child(i))
+                .filter(|c| c.visible())
+                .map(|c| c.h()),
+            RENDERER_SPACING,
+        );
+        if pack.h() != content_h {
+            pack.resize(pack.x(), pack.y(), pack.w(), content_h);
+            changed = true;
+        }
+        let scroll_h = renderer_area_height(window_h, scroll.y(), content_h);
+        if scroll.h() != scroll_h {
+            // the scroll's resize callback refits the pack width
+            scroll.resize(scroll.x(), scroll.y(), scroll.w(), scroll_h);
+            changed = true;
+        } else {
+            // narrow the buttons only when the vertical scrollbar shows, so it never covers them
+            fit_pack_width(scroll, pack);
+        }
+        // don't leave the view scrolled past the end after the area grew
+        let max_ypos = (content_h - scroll_h).max(0);
+        if scroll.yposition() > max_ypos {
+            scroll.scroll_to(0, max_ypos);
+            changed = true;
+        }
+        scroll.y() + scroll_h + VPACK_SPACING
+    } else {
+        feedback.y()
+    };
+    let target = feedback_target_height(window_h, feedback_y);
+    if feedback.y() != feedback_y || feedback.h() != target {
+        feedback.resize(feedback.x(), feedback_y, feedback.w(), target);
+        changed = true;
+    }
+    changed
+}
+
 impl MainForm {
     /// Builds the entire main window.
     pub fn create(
@@ -1479,12 +1487,21 @@ impl MainForm {
         let title_color: Color = Color::from_u32(0x00e6_fff0);
         let app = app::App::default().with_scheme(app::Scheme::Gtk);
         app::background(247, 247, 247);
+        // never open taller than the screen's work area (minus room for the title bar),
+        // the renderer scroll area takes up the slack
+        const TITLEBAR_ALLOWANCE: i32 = 40;
+        let (_, _, _, work_h) = app::screen_work_area(0);
+        let wh = if work_h > TITLEBAR_ALLOWANCE {
+            WH.min(work_h - TITLEBAR_ALLOWANCE)
+        } else {
+            WH
+        };
         let mut wind = DoubleWindow::default()
-            .with_size(WW, WH)
+            .with_size(WW, wh)
             .with_label(&fl!("window-title", "version" = app_version));
 
         wind.make_resizable(true);
-        wind.size_range(WW, WH * 2 / 3, 0, 0);
+        wind.size_range(WW, (WH * 2 / 3).min(wh), 0, 0);
 
         // set window icon
         let icon_bytes = include_str!("../../assets/swyh-rs logo note-only 16x16.svg");
@@ -1494,10 +1511,10 @@ impl MainForm {
 
         wind.end();
 
-        let mut vpack: Pack = Pack::new(XPOS, YPOS, GW, WH - 10, "");
+        let mut vpack: Pack = Pack::new(XPOS, YPOS, GW, wh - 10, "");
         vpack.make_resizable(true);
         vpack.set_type(PackType::Vertical);
-        vpack.set_spacing(15);
+        vpack.set_spacing(VPACK_SPACING);
         vpack.end();
         wind.add(&vpack);
 
@@ -1579,9 +1596,7 @@ impl MainForm {
                 // which transmutes the raw code and panics on non-button events (Move, Enter, ...)
                 if ev == Event::Push && app::event_button() == 3 {
                     if !get_config().hidden_renderers.is_empty() {
-                        let mut config = get_config_mut();
-                        config.hidden_renderers.clear();
-                        let _ = config.update_config();
+                        update_config_with(|c| c.hidden_renderers.clear());
                         config_changed.set(true);
                     }
                     true
@@ -1594,12 +1609,25 @@ impl MainForm {
         vpack.add(&flx_buttons_title);
 
         // ssdp discovered renderer buttons go here, stacked in their own nested pack
-        // so new buttons can just be inserted/removed from it directly
+        // so new buttons can just be inserted/removed from it directly.
+        // The pack lives in a vertical scroll area whose height is capped by
+        // fit_bottom_to_window(), so the buttons can't push the form past the window.
+        // Hidden until the first renderer button arrives.
+        let mut renderer_scroll = Scroll::new(0, 0, GW, 0, "");
+        renderer_scroll.set_type(ScrollType::Vertical);
+        renderer_scroll.end();
         let mut renderer_pack = Pack::new(0, 0, GW, 0, "");
         renderer_pack.set_type(PackType::Vertical);
-        renderer_pack.set_spacing(15);
+        renderer_pack.set_spacing(RENDERER_SPACING);
         renderer_pack.end();
-        vpack.add(&renderer_pack);
+        renderer_scroll.add(&renderer_pack);
+        // vpack widens the scroll area with the window, pass that on to the buttons
+        renderer_scroll.resize_callback({
+            let mut renderer_pack = renderer_pack.clone();
+            move |s, _, _, _, _| fit_pack_width(s, &mut renderer_pack)
+        });
+        renderer_scroll.hide();
+        vpack.add(&renderer_scroll);
 
         // setup feedback textbox at the bottom
         let mut flx_feedback = Flex::new(0, 0, GW, PREFERRED_FEEDBACK_H, "");
@@ -1642,6 +1670,8 @@ impl MainForm {
         // Event::Close, hiding the Window and preventing the Close handler being called.
         wind.handle({
             let mut flx_feedback = flx_feedback.clone();
+            let mut renderer_scroll = renderer_scroll.clone();
+            let mut renderer_pack = renderer_pack.clone();
             let mut wind = wind.clone();
             move |w, ev| match ev {
                 Event::Close => {
@@ -1649,17 +1679,14 @@ impl MainForm {
                     true
                 }
                 Event::Resize => {
-                    // resize flx_feedback to the available space after button insertions
-                    // recompute the feedback box height against the new window height
-                    // and only touch it if it actually needs to change.
-                    let target = feedback_target_height(w.h(), flx_feedback.y());
-                    if target != flx_feedback.h() {
-                        flx_feedback.resize(
-                            flx_feedback.x(),
-                            flx_feedback.y(),
-                            flx_feedback.w(),
-                            target,
-                        );
+                    // refit the renderer scroll area and the feedback box to the new
+                    // window height, and only redraw if something actually changed
+                    if fit_bottom_to_window(
+                        w.h(),
+                        &mut renderer_scroll,
+                        &mut renderer_pack,
+                        &mut flx_feedback,
+                    ) {
                         // force a redraw of the textdisplay tb
                         wind.flush();
                     }
@@ -1674,7 +1701,6 @@ impl MainForm {
 
         let mut mf = MainForm {
             player_index: 0,
-            slim_player_index: 0,
             wind,
             choose_audio_source_but: audio_tab.choose_audio_source_but,
             fmt_choice: audio_tab.fmt_choice,
@@ -1696,6 +1722,7 @@ impl MainForm {
             status_buf,
             restartbutton: flx_restart,
             renderer_pack,
+            renderer_scroll,
             bwidth: frame.width(),
             bheight: frame.height(),
             wd: *wd,
@@ -1705,7 +1732,7 @@ impl MainForm {
             log_lines: 0,
         };
         // fix the hor scrollbar problem on first show
-        mf.clamp_feedback_height();
+        mf.fit_to_window();
         mf
     }
 
@@ -1743,29 +1770,31 @@ impl MainForm {
     pub fn show_restart_button(&mut self) {
         self.restartbutton.show();
         self.refresh_status();
-        self.clamp_feedback_height();
+        self.fit_to_window();
         app::redraw();
     }
 
     /// `vpack` is an `Fl_Pack`, which auto-grows to fit the total height of its
     /// (visible) children on every draw, regardless of the window's own height
     /// (see `Fl_Pack::draw()` in cfltk). So showing the restart button or
-    /// inserting a renderer button can push `flx_feedback` (the trailing
-    /// feedback log) below the visible window.
-    ///
-    fn clamp_feedback_height(&mut self) {
+    /// inserting a renderer button would push `flx_feedback` (the trailing
+    /// feedback log) below the visible window. Cap the renderer scroll area and
+    /// the feedback box so everything stays inside the window.
+    fn fit_to_window(&mut self) {
+        // the scroll area only takes part in the layout once there are buttons in it
+        if self.renderer_pack.children() > 0 && !self.renderer_scroll.visible() {
+            self.renderer_scroll.show();
+        }
+        // let vpack position its (possibly just shown) children first
         app::redraw();
         app::flush();
-        let target = feedback_target_height(self.wind.h(), self.flx_feedback.y());
-        if target != self.flx_feedback.h() {
-            self.flx_feedback.resize(
-                self.flx_feedback.x(),
-                self.flx_feedback.y(),
-                self.flx_feedback.w(),
-                target,
-            );
-            //app::flush();
-        }
+        fit_bottom_to_window(
+            self.wind.h(),
+            &mut self.renderer_scroll,
+            &mut self.renderer_pack,
+            &mut self.flx_feedback,
+        );
+        app::redraw();
     }
 
     /// refresh the status tab content from the current config
@@ -1828,17 +1857,15 @@ impl MainForm {
                     if b.is_on() { "ON" } else { "OFF" },
                 );
                 if b.is_on() {
-                    {
-                        let mut conf = get_config_mut();
-                        conf.last_renderer = Some(b.label());
-                        let _ = conf.update_config();
-                    }
+                    update_config_with(|c| c.last_renderer = Some(b.label()));
                     let streaminfo = StreamInfo::new(wd.sample_rate);
                     newr_c.spawn_play(local_addr, streaminfo);
                 } else {
                     newr_c.spawn_stop_play();
                 }
-                get_renderers_mut()[player_index].playing = b.is_on();
+                if let RendererKind::Upnp(r) = &mut get_renderers_mut()[player_index] {
+                    r.playing.store(b.is_on(), Ordering::Relaxed);
+                }
             }
         });
         // the flex for the new button
@@ -1871,14 +1898,24 @@ impl MainForm {
                         this_renderer.controller.dev_name
                     );
                     this_renderer.spawn_set_volume(vol);
-                    get_renderers_mut()[player_index].volume = vol;
+                    if let RendererKind::Upnp(r) = &mut get_renderers_mut()[player_index] {
+                        r.volume = vol;
+                    }
                     if app::is_event_shift() {
                         debug!("Syncing volume for other active renderers");
-                        // get a copy of the renderers to use for network IO
+                        // get a copy of the renderers to use for network IO; `index` is
+                        // this entry's position in the merged RENDERERS list, so it stays
+                        // valid for the get_renderers_mut() write below even though we
+                        // only act on the UPnP entries here (same-protocol sync only)
                         let renderers = get_renderers().clone().into_iter().enumerate();
-                        for (index, mut rend) in renderers {
+                        for (index, kind) in renderers {
+                            let RendererKind::Upnp(mut rend) = kind else {
+                                continue;
+                            };
                             // if this renderer is playing but not the active slider renderer
-                            if rend.playing && (this_renderer.player_index != rend.player_index) {
+                            if rend.playing.load(Ordering::Relaxed)
+                                && (this_renderer.player_index != rend.player_index)
+                            {
                                 // and it supports setting the volume: sync volume
                                 if let Some(mut slider) = rend.rend_ui.slider.clone() {
                                     debug!(
@@ -1887,7 +1924,9 @@ impl MainForm {
                                     );
                                     rend.spawn_set_volume(vol);
                                     // update the original renderer volume value
-                                    get_renderers_mut()[index].volume = vol;
+                                    if let RendererKind::Upnp(r) = &mut get_renderers_mut()[index] {
+                                        r.volume = vol;
+                                    }
                                     // and update the slider too
                                     slider.set_value(s.value());
                                 }
@@ -1919,9 +1958,7 @@ impl MainForm {
                         if let Some(sl) = slider.as_mut() {
                             sl.hide();
                         }
-                        let mut config = get_config_mut();
-                        config.hidden_renderers.push(remote_addr.to_string());
-                        let _ = config.update_config();
+                        update_config_with(|c| c.hidden_renderers.push(remote_addr.to_string()));
                         config_changed.set(true);
                         true
                     }
@@ -1933,10 +1970,10 @@ impl MainForm {
             }
         });
         new_renderer.rend_ui.button = Some(pbut.clone());
-        // add the new renderer to the global list of renderers
-        get_renderers_mut().push(new_renderer.clone());
+        // add the new renderer to the merged global list of renderers
+        get_renderers_mut().push(RendererKind::Upnp(new_renderer.clone()));
         self.renderer_pack.insert(&flx_button, 0);
-        self.clamp_feedback_height();
+        self.fit_to_window();
         app::redraw();
         // now add the new player to the global list of renderers
         // check if autoreconnect is set for this renderer
@@ -1969,7 +2006,7 @@ impl MainForm {
         {
             return;
         }
-        new_renderer.player_index = self.slim_player_index;
+        new_renderer.player_index = self.player_index;
         new_renderer.spawn_set_volume(new_renderer.volume);
         // squeezelite always supports AUDG (unlike UPnP's GetVolume, which
         // can fail per-device), so the slider is unconditional here.
@@ -1985,7 +2022,7 @@ impl MainForm {
                 new_renderer.remote_addr
             ));
         pbut.set_callback({
-            let player_index = self.slim_player_index;
+            let player_index = self.player_index;
             let renderer = new_renderer.clone();
             let local_addr = self.local_addr;
             let wd = self.wd;
@@ -2011,7 +2048,9 @@ impl MainForm {
                 } else {
                     renderer.spawn_strm_stop();
                 }
-                get_slim_renderers_mut()[player_index].playing = b.is_on();
+                if let RendererKind::Slim(r) = &mut get_renderers_mut()[player_index] {
+                    r.playing = b.is_on();
+                }
             }
         });
         // the flex for the new button
@@ -2029,9 +2068,7 @@ impl MainForm {
             move |b, ev| match ev {
                 Event::Push if app::event_button() == 3 => {
                     b.hide();
-                    let mut config = get_config_mut();
-                    config.hidden_renderers.push(remote_addr.to_string());
-                    let _ = config.update_config();
+                    update_config_with(|c| c.hidden_renderers.push(remote_addr.to_string()));
                     config_changed.set(true);
                     true
                 }
@@ -2054,7 +2091,7 @@ impl MainForm {
         sl.set_value(new_renderer.volume.into());
         sl.set_trigger(enums::CallbackTrigger::Release);
         sl.set_callback({
-            let player_index = self.slim_player_index;
+            let player_index = self.player_index;
             let this_renderer = new_renderer.clone();
             move |s| {
                 let vol: i32 = s.value() as i32; // guaranteed between 0.0 and 100.0
@@ -2063,12 +2100,20 @@ impl MainForm {
                     this_renderer.remote_addr
                 );
                 this_renderer.spawn_set_volume(vol);
-                get_slim_renderers_mut()[player_index].volume = vol;
+                if let RendererKind::Slim(r) = &mut get_renderers_mut()[player_index] {
+                    r.volume = vol;
+                }
                 if app::is_event_shift() {
                     debug!("Syncing volume for other active SlimProto renderers");
-                    // get a copy of the renderers to use for network IO
-                    let renderers = get_slim_renderers().clone().into_iter().enumerate();
-                    for (index, rend) in renderers {
+                    // get a copy of the renderers to use for network IO; `index` is
+                    // this entry's position in the merged RENDERERS list, so it stays
+                    // valid for the get_renderers_mut() write below even though we
+                    // only act on the SlimProto entries here (same-protocol sync only)
+                    let renderers = get_renderers().clone().into_iter().enumerate();
+                    for (index, kind) in renderers {
+                        let RendererKind::Slim(rend) = kind else {
+                            continue;
+                        };
                         // if this renderer is playing but not the active slider renderer
                         if rend.playing && (this_renderer.player_index != rend.player_index) {
                             // squeezelite always supports AUDG: sync volume
@@ -2079,7 +2124,9 @@ impl MainForm {
                                 );
                                 rend.spawn_set_volume(vol);
                                 // update the original renderer volume value
-                                get_slim_renderers_mut()[index].volume = vol;
+                                if let RendererKind::Slim(r) = &mut get_renderers_mut()[index] {
+                                    r.volume = vol;
+                                }
                                 // and update the slider too
                                 slider.set_value(s.value());
                             }
@@ -2090,10 +2137,10 @@ impl MainForm {
         });
         flx_button.add(&sl);
         new_renderer.rend_ui.slider = Some(sl.clone());
-        // add the new renderer to the global list of SlimProto renderers
-        get_slim_renderers_mut().push(new_renderer.clone());
+        // add the new renderer to the merged global list of renderers
+        get_renderers_mut().push(RendererKind::Slim(new_renderer.clone()));
         self.renderer_pack.insert(&flx_button, 0);
-        self.clamp_feedback_height();
+        self.fit_to_window();
         app::redraw();
         // check if autoreconnect is set for this renderer
         if self.auto_reconnect.is_set() {
@@ -2107,8 +2154,8 @@ impl MainForm {
                 pbut.do_callback();
             }
         }
-        // bump slim_player_index
-        self.slim_player_index += 1;
+        // bump player_index
+        self.player_index += 1;
     }
 
     /// change the theme
@@ -2160,5 +2207,44 @@ mod feedback_height_tests {
         // 800px available, well past PREFERRED_FEEDBACK_H (296): should fill it
         // all rather than getting capped back down to the construction-time size
         assert_eq!(feedback_target_height(1200, 400), 800);
+    }
+
+    #[test]
+    fn stacked_height_adds_spacing_between_rows_only() {
+        assert_eq!(stacked_height([], 15), 0);
+        assert_eq!(stacked_height([25], 15), 25);
+        assert_eq!(stacked_height([25, 25, 25], 15), 3 * 25 + 2 * 15);
+    }
+
+    #[test]
+    fn renderer_area_fits_content_when_there_is_room() {
+        // 740 - 400 - spacing - min feedback leaves well over 2 rows
+        let content = stacked_height([25, 25], RENDERER_SPACING);
+        assert_eq!(renderer_area_height(740, 400, content), content);
+    }
+
+    #[test]
+    fn renderer_area_is_capped_above_a_minimum_feedback_box() {
+        let content = stacked_height([25; 20], RENDERER_SPACING);
+        let h = renderer_area_height(740, 400, content);
+        assert_eq!(h, 740 - 400 - VPACK_SPACING - MIN_FEEDBACK_H);
+        // and the feedback box then gets exactly its minimum height
+        assert_eq!(
+            feedback_target_height(740, 400 + h + VPACK_SPACING),
+            MIN_FEEDBACK_H
+        );
+    }
+
+    #[test]
+    fn renderer_area_keeps_two_rows_in_a_tiny_window() {
+        let content = stacked_height([25; 20], RENDERER_SPACING);
+        assert_eq!(renderer_area_height(500, 400, content), MIN_RENDERER_AREA_H);
+        // but never more than the content itself
+        assert_eq!(renderer_area_height(500, 400, 25), 25);
+    }
+
+    #[test]
+    fn renderer_area_is_empty_without_renderers() {
+        assert_eq!(renderer_area_height(740, 400, 0), 0);
     }
 }

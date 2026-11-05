@@ -42,7 +42,7 @@ assert withGui || withCli; let
     then "swyh-rs-gui"
     else "swyh-rs-cli";
   swyh-rs = rustPlatform.buildRustPackage rec {
-    version = "1.21.1";
+    version = "1.21.2";
     inherit nativeBuildInputs buildInputs pname;
     # Filter-out generated, version-control and nix-related files to prevent
     # cache invalidation while editing them
@@ -55,9 +55,6 @@ assert withGui || withCli; let
       src = lib.cleanSource ./.;
     };
     cargoLock.lockFile = ./Cargo.lock;
-    cargoLock.outputHashes = {
-      "figura-1.3.3" = "sha256-QnheoM/G9aYQe9OytfkPg2648cTJNiL+IaKFdb66r8I=";
-    };
     buildPhase =
       ''
         runHook preBuild

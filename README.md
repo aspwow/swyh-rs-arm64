@@ -32,7 +32,7 @@ A "Stream-What-You-Hear" implementation written in Rust, MIT licensed.
 
 ## Current Release
 
-The current release is **[1.21.0](https://github.com/dheijl/swyh-rs/releases/tag/1.21.0)**, refer to the [Changelog](CHANGELOG.md) for more details.
+The current release is **[1.21.1](https://github.com/dheijl/swyh-rs/releases/tag/1.21.1)**, refer to the [Changelog](CHANGELOG.md) for more details.
 
 You can find x86/64  Windows setup and binaries and Linux (Ubuntu/Debian) appimages in [Releases](https://github.com/dheijl/swyh-rs/releases).
 
@@ -300,12 +300,11 @@ Recognized options:
     -x (--serve_only) bool: only run the music server, no ssdp discovery [false]
     -v (--volume) u8 : desired player volume between 0 and 100 [unchanged]
     -u (--upfront_buffer) u32 : initial buffering in milliseconds [0]
-    -g (--latency_reduction_delay) u32 : wait this many msec after connecting before dropping audio to reduce latency, giving the renderer's own buffer time to fill [0]
-    -D (--latency_reduction) u32 : once latency_reduction_delay has elapsed, drop this many msec of audio to reduce playback latency [0]
+    -D (--latency_reduction) delay_ms,drop_ms : wait delay_ms msec after connecting (giving the renderer's own buffer time to fill), then drop drop_ms msec of audio to reduce playback latency [0,0]
     -L (--language) string : UI language code (e.g. en-US, nl-BE) [en-US]
     -R (--sample_rate) u32 : sample rate (44100/48000/88200/96000/176400/192000/352800/384000) [configured/44100]
     -d (--dither) bool : use TPDF dither for 16-bit output [true]
-    -P (--slimproto) bool : enable SlimProto/squeezelite support [true]
+    -P (--slimproto) bool : enable SlimProto/squeezelite support [config: enable_slimproto, default true]
 ```
 
 The default values for missing options are given between square brackets. Refer to the GUI description for an explanation of the options.
@@ -314,7 +313,7 @@ Most options except -h, -n and -x are saved in the config file, so once a config
 Options -h, -n and -x will ignore the optional boolean argument (true/false) if specified. Specifying the option alone is equivalent to true.
 Other boolean options accept an optional true/false, because they are remembered in the config file and you should be able to change the stored value.
 
-Short options allow you to append the value to the short option, for example -S44100 is equivalent to -S 44100 and --sample_rate 44100, same for -xno etc...
+Short options allow you to append the value to the short option, for example -R44100 is equivalent to -R 44100 and --sample_rate 44100, same for -xno etc...
 
 Boolean values accept y/yes/n/no/t/true/f/false/1/0.
 
@@ -345,6 +344,7 @@ If you do not specify a player swyh-rs-cli switches to serve_only mode.
 - WAV is in theory limited to 4 GB streaming, so it's possible that it only works with an u32Max streamsize. But you can try if NoneChunked works. 4 GB is only a couple of hours of streaming depending on sample size and sample rate. On MoodeAudio WAV only works with U32MaxNotChunked, but RF64 and FLAC work with anything. It depends on the decoder used in the receiver.
 - On some receivers WAV and RF64 will cause an extra HTTP request, increasing latency slightly.
 - If you suffer from hiccups or drop-outs caused by your WiFi network, use FLAC, as the compression increases buffering in the receiver. This makes it less likely that you will suffer from audio stuttering.
+- version 1.21.1 introduces two new parameters in the `Audio` tab: `Latency reduction delay (msec)` and `Amount (msec)`, both default 0. They allow you to experiment with latency reduction. The delay is the time you allow the player to buffer audio before latency reduction kicks in. Latency reduction is attempted by dropping a number of msecs of audio frames, hopefully reducing latency. But the player can decide that the dropped frames causes its buffer to become too small, so it may start buffering, undoing the latency decrease attempt. Anyway, you can try it, starting with small amounts like 25 msec, it may help or it may not. If both values are 0 (zero) latency reduction is disabled.
 
 ### Audio quality and Windows WasApi Loopback capture
 
@@ -395,18 +395,18 @@ MAC: I'm sorry but I don't have one... If you have one and would like to contrib
 
 ### Screenshots
 
+- the Status settings tab:
+
+<img width="700" height="927" alt="Schermafdruk van 2026-11-03 10-10-41" src="https://github.com/user-attachments/assets/2863bbb6-f3f5-415c-9b17-9c1c7a024b76" />
+
 - the App settings tab:
 
-<img width="700" height="772" alt="app" src="https://github.com/user-attachments/assets/4f0424e7-5425-4d61-a343-4df6ba915e99" />
-
-- the Audio settings tab:
-
-<img width="700" height="772" alt="image" src="https://github.com/user-attachments/assets/48022539-f403-4882-8b33-05176a0526b7" />
+<img width="700" height="927" alt="Schermafdruk van 2026-11-03 10-11-06" src="https://github.com/user-attachments/assets/6086117b-bd9f-40f9-a2f2-43d79ff067e5" />
 
 - the Network settings tab:
 
-<img width="700" height="772" alt="image" src="https://github.com/user-attachments/assets/35afe373-e11e-4175-a3a0-f3162761716b" />
+<img width="700" height="927" alt="Schermafdruk van 2026-11-03 10-11-28" src="https://github.com/user-attachments/assets/ceb464f7-9f47-497d-8b22-e9180e35d7c9" />
 
-- the Status tab:
+- the Audio settings tab:
 
-<img width="700" height="772" alt="status" src="https://github.com/user-attachments/assets/8335f5f1-453b-4f6e-9569-1b867e36282a" />
+<img width="700" height="927" alt="Schermafdruk van 2026-11-03 10-11-54" src="https://github.com/user-attachments/assets/a3664e80-195f-40f4-8135-c30e187197e3" />

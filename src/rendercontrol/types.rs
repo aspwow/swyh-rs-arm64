@@ -6,7 +6,10 @@
 
 use crate::{
     enums::streaming::{BitDepth, StreamingFormat},
-    globals::statics::{SERVER_PORT, get_config},
+    globals::{
+        RendererKind,
+        statics::{SERVER_PORT, get_config},
+    },
 };
 use ecow::EcoString;
 #[cfg(feature = "gui")]
@@ -118,7 +121,8 @@ pub struct Renderer {
     pub dev_url: EcoString,
     pub volume: i32,
     pub location: EcoString,
-    pub playing: bool,
+    /// shared (via `Arc`) across every clone for easy update
+    pub playing: Arc<AtomicBool>,
     #[cfg(feature = "gui")]
     /// the GUI fields associated with this renderer neede when the streaming
     /// sends a feedback message to the UI or when syncing volume sliders
@@ -142,40 +146,101 @@ pub struct Renderer {
 }
 
 /// Decide which (if any) UPnP renderer a `StreamerFeedBack`/`ChannelStream`
-/// belongs to, given its remote IP and its `is_slim` marker (see
-/// `StreamingContext::slim`), against the IPs of the currently-known UPnP
-/// renderers (in `get_renderers()` order).
-///
+/// belongs to.
 /// Returns `None` — a deliberate no-op, never a panic/unwrap — when:
-/// * the feedback is SlimProto's own (`is_slim == true`): it was never a UPnP
-///   renderer's traffic in the first place, no matter what shares its IP;
 /// * no UPnP renderer's IP matches at all (e.g. a manually-entered stream URL
 ///   fetched by something that isn't one of our discovered renderers
 /// * more than one UPnP renderer shares this IP (ambiguous — matches the
 ///   pre-existing "Bubble UPnP same-IP" bail-out behaviour).
-pub fn match_upnp_renderer_index<'a>(
-    is_slim: bool,
+pub fn find_matching_upnp_renderer(
+    renderers: &[RendererKind],
     feedback_ip: &str,
-    upnp_renderer_ips: impl Iterator<Item = &'a str>,
-) -> Option<usize> {
-    if is_slim {
-        return None;
-    }
-    let mut found: Option<usize> = None;
-    for (i, ip) in upnp_renderer_ips.enumerate() {
-        if ip == feedback_ip {
+) -> Option<Renderer> {
+    let mut found: Option<&Renderer> = None;
+    for renderer in renderers.iter().filter_map(RendererKind::as_upnp) {
+        if renderer.controller.remote_addr == feedback_ip {
+            // more then 1 upnp renderer at ths ip
             if found.is_some() {
                 return None;
             }
-            found = Some(i);
+            found = Some(renderer);
         }
     }
-    found
+    found.cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slimproto::{parse_frames::SlimHelo, types::SlimRenderer};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    fn upnp_renderer(remote_addr: &str) -> RendererKind {
+        let mut r = Renderer::new(&ureq::agent());
+        Arc::make_mut(&mut r.controller).remote_addr = remote_addr.into();
+        RendererKind::Upnp(r)
+    }
+
+    fn slim_renderer(remote_addr: &str) -> RendererKind {
+        let helo = SlimHelo {
+            device_id: 12,
+            revision: 0,
+            mac: [0, 1, 2, 3, 4, 5],
+            uuid: None,
+            wlan_channel_list: 0,
+            bytes_received: 0,
+            capabilities: "".into(),
+            lang: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let stream = std::net::TcpStream::connect(addr).expect("connect loopback stream");
+        RendererKind::Slim(SlimRenderer::from_helo(
+            &helo,
+            remote_addr.into(),
+            12345,
+            Arc::new(Mutex::new(stream)),
+        ))
+    }
+
+    #[test]
+    fn find_matching_upnp_renderer_single_match() {
+        let renderers = [upnp_renderer("192.168.1.10"), upnp_renderer("192.168.1.20")];
+        let found =
+            find_matching_upnp_renderer(&renderers, "192.168.1.20").expect("expected a match");
+        assert_eq!(found.controller.remote_addr, "192.168.1.20");
+    }
+
+    /// Merging the UPnP and SlimProto renderer lists: select
+    /// the correct renderer matching unique ip + type
+    #[test]
+    fn find_matching_upnp_renderer_skips_interleaved_slim_renderers() {
+        let renderers = [
+            slim_renderer("192.168.1.5"),
+            upnp_renderer("192.168.1.10"),
+            slim_renderer("192.168.1.6"),
+            upnp_renderer("192.168.1.20"),
+        ];
+        let found =
+            find_matching_upnp_renderer(&renderers, "192.168.1.10").expect("expected a match");
+        assert_eq!(found.controller.remote_addr, "192.168.1.10");
+        let found =
+            find_matching_upnp_renderer(&renderers, "192.168.1.20").expect("expected a match");
+        assert_eq!(found.controller.remote_addr, "192.168.1.20");
+    }
+
+    #[test]
+    fn find_matching_upnp_renderer_ambiguous_same_ip() {
+        let renderers = [upnp_renderer("192.168.1.10"), upnp_renderer("192.168.1.10")];
+        assert!(find_matching_upnp_renderer(&renderers, "192.168.1.10").is_none());
+    }
+
+    #[test]
+    fn find_matching_upnp_renderer_no_match() {
+        let renderers = [upnp_renderer("192.168.1.10")];
+        assert!(find_matching_upnp_renderer(&renderers, "192.168.1.99").is_none());
+    }
 
     #[test]
     fn control_url_harman_kardon() {
@@ -202,52 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn match_upnp_renderer_index_single_match() {
-        let ips = ["192.168.1.10", "192.168.1.20"];
-        assert_eq!(
-            match_upnp_renderer_index(false, "192.168.1.10", ips.into_iter()),
-            Some(0)
-        );
-        assert_eq!(
-            match_upnp_renderer_index(false, "192.168.1.20", ips.into_iter()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn match_upnp_renderer_index_ambiguous_same_ip() {
-        let ips = ["192.168.1.10", "192.168.1.10"];
-        assert_eq!(
-            match_upnp_renderer_index(false, "192.168.1.10", ips.into_iter()),
-            None
-        );
-    }
-
-    #[test]
-    fn match_upnp_renderer_index_slim_feedback_ignored() {
-        let ips = ["192.168.1.10"];
-        assert_eq!(
-            match_upnp_renderer_index(true, "192.168.1.10", ips.into_iter()),
-            None
-        );
-    }
-
-    #[test]
-    fn match_upnp_renderer_index_no_match() {
-        let ips = ["192.168.1.10"];
-        assert_eq!(
-            match_upnp_renderer_index(false, "192.168.1.99", ips.into_iter()),
-            None
-        );
-    }
-
-    #[test]
-    fn match_upnp_renderer_index_empty_list() {
-        let ips: [&str; 0] = [];
-        assert_eq!(
-            match_upnp_renderer_index(false, "192.168.1.10", ips.into_iter()),
-            None
-        );
+    fn find_matching_upnp_renderer_empty_list() {
+        let renderers: [RendererKind; 0] = [];
+        assert!(find_matching_upnp_renderer(&renderers, "192.168.1.10").is_none());
     }
 
     #[test]
