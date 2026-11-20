@@ -24,7 +24,6 @@ use ecow::EcoString;
 use fastrand::Rng;
 use log::debug;
 use std::{
-    collections::VecDeque,
     io::{Error, Read, Result as IoResult},
     sync::{
         Arc,
@@ -44,7 +43,7 @@ pub type AudioSamples = Arc<[f32]>;
 
 /// Quantize each 4-sample chunk with `quantize`, then pack the resulting `[i32; 4]`
 /// into the matching output bytes with `pack`. Generic over both so that each call site
-/// in [`ChannelStream::fill_lpcm_buffer`] — one per `(endianness, bd, use_dither)`
+/// in [`LpcmFormat::convert`] — one per `(endian, bd, dither)`
 /// combination — monomorphizes its own copy of this loop with a specific
 /// quantizer/packer pair resolved at the type level, guaranteeing a branch-free loop
 /// body regardless of optimization level.
@@ -62,6 +61,64 @@ fn quantize_and_pack<'b, 's, Q, P>(
     });
 }
 
+/// LPCM/WAV/RF64 output sample format: how groups of 4 f32 samples are
+/// quantized and packed into the HTTP read buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LpcmFormat {
+    /// WAV/RF64 are little endian, raw LPCM is big endian
+    endian: Endian,
+    bd: BitDepth,
+    /// only applies to 16 bit, 24 bit is never dithered
+    dither: Dither,
+}
+
+impl LpcmFormat {
+    /// number of output bytes for one group of 4 samples
+    const fn bytes_per_group(self) -> usize {
+        4 * self.bd.bytes()
+    }
+
+    /// Convert `groups` into `out`, which must be exactly
+    /// `groups.len() * self.bytes_per_group()` bytes long.
+    /// `quantize_and_pack` is generic over the quantizer/packer pair, so each
+    /// arm below monomorphizes its own branch-free copy of the loop with a
+    /// specific function pair baked in.
+    fn convert(self, out: &mut [u8], groups: &[[f32; 4]]) {
+        debug_assert_eq!(out.len(), groups.len() * self.bytes_per_group());
+        let chunks_iter = out.chunks_exact_mut(self.bytes_per_group()).zip(groups);
+        match (self.endian, self.bd, self.dither) {
+            (Little, Bits16, Dither) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_16_dither, i32_to_i16le);
+            }
+            (Little, Bits16, NoDither) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_16, i32_to_i16le);
+            }
+            (Little, Bits24, _) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_24, i32_to_i24le);
+            }
+            (Big, Bits16, Dither) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_16_dither, i32_to_i16be);
+            }
+            (Big, Bits16, NoDither) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_16, i32_to_i16be);
+            }
+            (Big, Bits24, _) => {
+                quantize_and_pack(chunks_iter, f32x4_to_i32x4_24, i32_to_i24be);
+            }
+        }
+    }
+}
+
+/// Receive the next chunk of f32 samples from `r`, or a clone of the
+/// `silence` buffer if no samples arrive within `timeout`.
+fn recv_or_silence(
+    r: &Receiver<AudioSamples>,
+    timeout: Duration,
+    silence: &AudioSamples,
+) -> AudioSamples {
+    r.recv_timeout(timeout).unwrap_or_else(|_| silence.clone())
+}
+
 /// Channelstream - used to transport the f32 samples from the `wave_reader`
 /// to the http output stream in LPCM/WAV/FLAC format
 /// implements `Read` for the HTTP streaming
@@ -73,17 +130,14 @@ pub struct ChannelStream {
     /// distinguishes a SlimProto fetch from an UPnP fetch when
     /// both share the same `remote_ip` (e.g. MoOde exposing both).
     pub is_slim: bool,
-    pub streaming_format: StreamingFormat,
-    fifo: VecDeque<f32>,
-    flac_fifo: VecDeque<u8>,
+    sample_cursor: SampleCursor,
+    flac_cursor: ChunkCursor,
     // Arc'd to prevent copying when Cloning in the server
     silence: Arc<[f32]>,
     capture_timeout: Duration,
-    sending_silence: bool,
-    wav_hdr: Vec<u8>,
-    use_wave_format: bool,
-    bits_per_sample: u16,
-    use_dither: Dither,
+    /// WAV/RF64 header still to be sent, `None` for other formats or once sent
+    wav_hdr: Option<Vec<u8>>,
+    lpcm_format: LpcmFormat,
     flac_channel: Option<FlacChannel>,
     /// Set by [`Self::request_stop`] to make `Read::read` return EOF on the
     /// next call, ending the HTTP response even if the client itself never
@@ -126,34 +180,38 @@ impl ChannelStream {
             None
         };
         let capture_timeout = u64::from(get_config().capture_timeout.unwrap_or(5));
-        let mut wav_hdr = match context.streaming_format {
-            StreamingFormat::Wav => {
-                create_wav_hdr(context.sample_rate, context.bits_per_sample as u16)
-            }
-            StreamingFormat::Rf64 => {
-                create_rf64_hdr(context.sample_rate, context.bits_per_sample as u16)
-            }
-            _ => Vec::new(),
-        };
-        // Trim the header when the client requested Range: bytes=N- (N within header)
-        if header_offset > 0 && !wav_hdr.is_empty() {
-            wav_hdr.drain(..header_offset.min(wav_hdr.len()));
+        let wav_hdr = match context.streaming_format {
+            StreamingFormat::Wav => Some(create_wav_hdr(
+                context.sample_rate,
+                context.bits_per_sample as u16,
+            )),
+            StreamingFormat::Rf64 => Some(create_rf64_hdr(
+                context.sample_rate,
+                context.bits_per_sample as u16,
+            )),
+            _ => None,
         }
+        // Trim the header when the client requested Range: bytes=N- (N within header)
+        .map(|mut hdr| {
+            hdr.drain(..header_offset.min(hdr.len()));
+            hdr
+        })
+        .filter(|hdr| !hdr.is_empty());
         let chs = ChannelStream {
             s: tx,
             r: rx,
-            fifo: VecDeque::with_capacity(16384),
-            flac_fifo: VecDeque::with_capacity(16384),
+            sample_cursor: SampleCursor::default(),
+            flac_cursor: ChunkCursor::default(),
             silence: get_silence_buffer(context.sample_rate, capture_timeout / 4).into(),
             capture_timeout: Duration::from_millis(capture_timeout), // silence kicks in after CAPTURE_TIMEOUT seconds
-            sending_silence: false,
             remote_ip: context.remote_ip.clone(),
             is_slim: context.slim,
             wav_hdr,
-            use_wave_format: context.needs_wav_hdr(),
-            bits_per_sample: context.bits_per_sample as u16,
-            use_dither: context.use_dither,
-            streaming_format: context.streaming_format,
+            lpcm_format: LpcmFormat {
+                endian: if context.needs_wav_hdr() { Little } else { Big },
+                bd: context.bits_per_sample,
+                dither: context.use_dither,
+            },
             flac_channel,
             stop: Arc::new(AtomicBool::new(false)),
             connected_at: Instant::now(),
@@ -234,130 +292,188 @@ impl ChannelStream {
         let _ = self.s.send(samples);
     }
 
-    /// fill the LPCM/WAV/RF64 fifo buffer with f32 samples
-    /// (or with f32 silence if no samples are coming)
-    fn get_samples(&mut self) {
-        let time_out = self.capture_timeout;
-        if let Ok(chunk) = self.r.recv_timeout(time_out) {
-            self.fifo.extend(chunk.iter());
-            self.sending_silence = false;
-        } else {
-            self.fifo.extend(self.silence.iter());
-            self.sending_silence = true;
-        }
-    }
-
     /// fill the HTTP read buffer with encoded flac data from the FlacChannel
     /// the f32 samples have already been encoded to FLAC and written to the
     /// `flac_out` channel of the `FlacChannel` encoder thread.
-    /// the `flac_in` channel of the `FlacChannel` is read here and pushed on the
-    /// `flac_fifo` `VecDeque` for transmission
+    /// the `flac_in` channel of the `FlacChannel` is read here, and the received
+    /// chunks are copied straight into the read buffer via `flac_cursor`
     fn fill_flac_buffer(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         debug_assert!(self.flac_channel.is_some());
-        // borrow instead of clone: `self.flac_channel` and `self.flac_fifo` are
+        // borrow instead of clone: `self.flac_channel` and `self.flac_cursor` are
         // disjoint fields, so this doesn't need its own `Receiver` handle
         let flac_in = &self.flac_channel.as_ref().unwrap().flac_in;
-        // make sure we have enough data for this read buffer
-        while self.flac_fifo.len() < buf.len() {
-            let Ok(chunk) = flac_in.recv() else {
-                return Err(Error::other("FLAC channel receive error."));
-            };
-            self.flac_fifo.append(&mut VecDeque::from(chunk));
-        }
-        // fill the buffer with the number of FLAC bytes needed from the fifo
-        copy_fifo_front(&self.flac_fifo, buf);
-        // remove the copied bytes from the front of the fifo
-        self.flac_fifo.retain_back(self.flac_fifo.len() - buf.len());
-        Ok(buf.len())
+        self.flac_cursor.fill(buf, || {
+            flac_in
+                .recv()
+                .map_err(|_| Error::other("FLAC channel receive error."))
+        })
     }
 
-    /// Fill the HTTP read buffer with LPCM/WAV/RF64 data from the f32 samples `VecDeque` fifo.
-    /// The f32 samples are read from the f32 input channel and buffered in the`VecDeque` fifo.
-    /// The VecDeque is then read for conversion to LPCM/WAV/RF64 data and
-    /// stored in the HTTP transmission buffer as needed
+    /// Fill the HTTP read buffer with LPCM/WAV/RF64 data.
+    /// The f32 sample chunks are read from the f32 input channel (or replaced by
+    /// silence after `capture_timeout`) and converted straight from the received
+    /// chunks into the HTTP transmission buffer via `sample_cursor`, which only
+    /// ever hands out whole groups of 4 samples (SSE2 f32x4).
     fn fill_lpcm_buffer(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        /// the f32 samples are converted in chunks of 4 f32 values (SSE2 f32x4)
-        const CHUNK_SIZE: usize = 4;
         debug_assert!(self.flac_channel.is_none());
-        if self.use_wave_format && !self.wav_hdr.is_empty() {
-            let i = self.wav_hdr.len();
+        if let Some(hdr) = self.wav_hdr.take() {
+            let i = hdr.len();
             debug_assert!(
                 buf.len() >= i,
                 "HTTP read buffer smaller than WAV/RF64 header!"
             );
-            buf[..i].copy_from_slice(&self.wav_hdr);
-            self.wav_hdr.clear();
+            buf[..i].copy_from_slice(&hdr);
             return Ok(i);
         }
-        // make sure we have enough samples ready to fill the read buffer
-        let bytes_per_sample = (self.bits_per_sample / 8) as usize;
-        let buf_chunksize = bytes_per_sample * 4;
-        let chunks_needed = buf.len() / buf_chunksize;
-        let samples_needed: usize = chunks_needed * 4;
-        while self.fifo.len() < samples_needed {
-            self.get_samples();
-        }
-        // setup sample conversion parameters
-        let endianness: Endian = if self.use_wave_format { Little } else { Big };
-        let bd = BitDepth::from(self.bits_per_sample);
-        // make the fifo contiguous so we can slice it directly (avoiding iterator overhead per chunk)
-        // for 16 bit it seems always contiguous, for 24 bit it is not, but never needs rotating either
-        {
-            let samples = self.fifo.make_contiguous();
-            // samples_needed is always a multiple of CHUNK_SIZE, so the remainder is empty
-            let (sample_chunks, _) = samples[..samples_needed].as_chunks::<CHUNK_SIZE>();
-            // zip the buf in chunks of buf_chunksize with the sample chunks of 4 f32 values
-            let chunks_iter = buf.chunks_exact_mut(buf_chunksize).zip(sample_chunks);
-            // convert the f32 samples to i16 or i24 little/big endian to fill the buffer
-            // `quantize_and_pack` is generic over the quantizer/packer pair, so
-            // each arm below monomorphizes its own branch-free copy of the loop with a
-            // specific function pair baked in
-            let use_dither = self.use_dither;
-            match (endianness, bd, use_dither) {
-                (Little, Bits16, Dither) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_16_dither, i32_to_i16le);
-                }
-                (Little, Bits16, NoDither) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_16, i32_to_i16le);
-                }
-                (Little, Bits24, _) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_24, i32_to_i24le);
-                }
-                (Big, Bits16, Dither) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_16_dither, i32_to_i16be);
-                }
-                (Big, Bits16, NoDither) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_16, i32_to_i16be);
-                }
-                (Big, Bits24, _) => {
-                    quantize_and_pack(chunks_iter, f32x4_to_i32x4_24, i32_to_i24be);
-                }
-            }
-        } // make_contiguous borrow ends here
-        // remove the consumed samples from the front of the fifo
-        self.fifo.retain_back(self.fifo.len() - samples_needed);
-        Ok(chunks_needed * buf_chunksize)
+        // borrow only the fields the closures need (not all of `self`), so they
+        // can coexist with the `&mut self.sample_cursor` borrow below
+        let fmt = self.lpcm_format;
+        let (r, timeout, silence) = (&self.r, self.capture_timeout, &self.silence);
+        Ok(self.sample_cursor.fill(
+            buf,
+            fmt.bytes_per_group(),
+            || recv_or_silence(r, timeout, silence),
+            |out, groups| fmt.convert(out, groups),
+        ))
     }
 }
 
-/// Copy `buf.len()` bytes from the front of `fifo` into `buf`.
+/// Read position within the most recently received chunk of f32 samples, so the
+/// samples can be converted straight from the chunk into the HTTP read buffer
+/// without first being copied into an intermediate fifo.
 ///
-/// `fifo` is a `VecDeque`, so its contents may be split across two
-/// underlying slices; this copies from both as needed.
-/// the fifo instance here is guaranteed to contain at least
-/// buf.len() bytes by the caller
-fn copy_fifo_front(fifo: &VecDeque<u8>, buf: &mut [u8]) {
-    debug_assert!(fifo.len() >= buf.len());
-    let (s1, s2) = fifo.as_slices();
-    let (l1, l2) = if s1.len() >= buf.len() {
-        (buf.len(), 0)
-    } else {
-        (s1.len(), buf.len() - s1.len())
-    };
-    debug_assert!(l1 + l2 == buf.len());
-    buf[..l1].copy_from_slice(&s1[..l1]);
-    if l2 > 0 {
-        buf[l1..].copy_from_slice(&s2[..l2]);
+/// The converters work on groups of 4 samples (f32x4), but chunk lengths are
+/// arbitrary (e.g. 882 samples for 441-frame WASAPI periods at 44.1 kHz). So
+/// `push` splits each chunk into:
+/// - a stitched `head` group: the 0..=3 samples left over from the previous
+///   chunk, completed with the first samples of this one (copied, max 4 samples)
+/// - the whole groups `chunk[pos..end]`, handed out without copying
+/// - the 0..=3 leftover samples `chunk[end..]`, saved in `carry` for the next push
+#[derive(Clone, Default)]
+struct SampleCursor {
+    /// the chunk currently being consumed
+    chunk: AudioSamples,
+    /// next unread sample in `chunk`
+    pos: usize,
+    /// end of the whole groups in `chunk`, `(end - pos) % 4 == 0`
+    end: usize,
+    /// stitched group straddling the previous chunk boundary
+    head: [f32; 4],
+    /// `head` still has to be handed out (before `chunk[pos..end]`)
+    has_head: bool,
+    /// 0..=3 samples left over from previous chunks, waiting to be completed
+    carry: Vec<f32>,
+}
+
+impl SampleCursor {
+    /// true when all whole groups are used up and a new chunk must be pushed
+    fn is_empty(&self) -> bool {
+        !self.has_head && self.pos == self.end
+    }
+
+    /// Make `chunk` the current chunk; only call this when `is_empty()`.
+    /// The result can still be empty (a chunk too short to complete a group
+    /// only grows `carry`), so callers must check `is_empty()` again.
+    fn push(&mut self, chunk: AudioSamples) {
+        debug_assert!(self.is_empty());
+        let mut start = 0;
+        if !self.carry.is_empty() {
+            // complete the pending group from the start of the new chunk
+            start = (4 - self.carry.len()).min(chunk.len());
+            self.carry.extend_from_slice(&chunk[..start]);
+            if self.carry.len() == 4 {
+                self.head.copy_from_slice(&self.carry);
+                self.has_head = true;
+                self.carry.clear();
+            }
+        }
+        // whole groups after `start`, the 0..=3 samples after them go to `carry`
+        let end = start + (chunk.len() - start) / 4 * 4;
+        self.carry.extend_from_slice(&chunk[end..]);
+        self.chunk = chunk;
+        self.pos = start;
+        self.end = end;
+    }
+
+    /// Take up to `max_groups` (at least 1) groups of 4 samples: the stitched
+    /// head group if pending, else whole groups from the current chunk
+    fn next_groups(&mut self, max_groups: usize) -> &[[f32; 4]] {
+        if self.has_head {
+            self.has_head = false;
+            return std::slice::from_ref(&self.head);
+        }
+        let (groups, _) = self.chunk[self.pos..self.end].as_chunks::<4>();
+        let groups = &groups[..max_groups.min(groups.len())];
+        self.pos += groups.len() * 4;
+        groups
+    }
+
+    /// Fill `buf` with as many whole groups of 4 samples as fit, at
+    /// `bytes_per_group` bytes each, pushing new chunks from `next_chunk` as
+    /// needed. `convert(out, groups)` writes `groups` into `out`, which is
+    /// exactly `groups.len() * bytes_per_group` bytes long. It is called once
+    /// per contiguous run of groups, not once per group.
+    /// Any tail of `buf` shorter than a group is left untouched.
+    /// Returns the number of bytes written.
+    fn fill(
+        &mut self,
+        buf: &mut [u8],
+        bytes_per_group: usize,
+        mut next_chunk: impl FnMut() -> AudioSamples,
+        mut convert: impl FnMut(&mut [u8], &[[f32; 4]]),
+    ) -> usize {
+        let groups_needed = buf.len() / bytes_per_group;
+        // number of groups of 4 samples converted so far
+        let mut done = 0;
+        while done < groups_needed {
+            if self.is_empty() {
+                self.push(next_chunk());
+                continue; // a tiny chunk may leave the cursor still empty
+            }
+            let groups = self.next_groups(groups_needed - done);
+            let out = &mut buf[done * bytes_per_group..][..groups.len() * bytes_per_group];
+            convert(out, groups);
+            done += groups.len();
+        }
+        groups_needed * bytes_per_group
+    }
+}
+
+/// Read position within the most recently received chunk of encoded bytes
+/// (the FLAC encoder output), so chunks can be copied straight into the HTTP
+/// read buffer without first being appended to an intermediate fifo.
+#[derive(Clone, Default)]
+struct ChunkCursor {
+    /// the chunk currently being consumed
+    chunk: Vec<u8>,
+    /// number of bytes of `chunk` already copied out
+    pos: usize,
+}
+
+impl ChunkCursor {
+    /// Fill `buf` completely, first from the unconsumed remainder of the
+    /// current chunk, then from new chunks obtained via `next_chunk`.
+    /// Bytes left over from the last chunk are kept for the next call.
+    /// Returns `buf.len()`, or the first error `next_chunk` returns.
+    fn fill<E>(
+        &mut self,
+        buf: &mut [u8],
+        mut next_chunk: impl FnMut() -> Result<Vec<u8>, E>,
+    ) -> Result<usize, E> {
+        let mut written = 0;
+        while written < buf.len() {
+            if self.pos == self.chunk.len() {
+                // current chunk used up: take the next one
+                self.chunk = next_chunk()?;
+                self.pos = 0;
+                continue;
+            }
+            let n = (buf.len() - written).min(self.chunk.len() - self.pos);
+            buf[written..written + n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+            written += n;
+            self.pos += n;
+        }
+        Ok(written)
     }
 }
 
@@ -736,99 +852,442 @@ mod tests {
         eprintln!("{noise:?}");
     }
 
-    /// Replays the exact `make_contiguous()` + `retain_back()` sequence used
-    /// by `fill_lpcm_buffer` (see rwstream.rs) against a `VecDeque<u64>` of
-    /// unique, monotonically increasing values, so any reordering, loss, or
-    /// duplication caused by the ring buffer's internal rotation shows up as
-    /// a value mismatch rather than just a length mismatch.
-    ///
-    /// Capacity is pinned deliberately small (4) so that the random mix of
-    /// push/consume sizes below is guaranteed to repeatedly wrap the
-    /// underlying ring buffer and force reallocations, exercising both
-    /// branches inside `retain_back` (head-in-`front`, head-in-`back`) many
-    /// times over, not just the always-unwrapped case right after a single
-    /// `make_contiguous()` call.
-    #[test]
-    #[cfg(debug_assertions)]
-    fn test_make_contiguous_retain_back_fifo_invariant() {
-        use std::collections::VecDeque;
+    /// Build chunks of the given lengths holding consecutive sample values
+    /// 0.0, 1.0, 2.0, ... (exact in f32), so any loss, duplication or
+    /// reordering by the cursor shows up as a value mismatch.
+    fn numbered_chunks(lens: &[usize]) -> Vec<AudioSamples> {
+        let mut next = 0.0f32;
+        lens.iter()
+            .map(|&len| {
+                let chunk: Vec<f32> = (0..len).map(|i| next + i as f32).collect();
+                next += len as f32;
+                AudioSamples::from(chunk)
+            })
+            .collect()
+    }
 
-        let mut rng = Rng::with_seed(0x5a17_u64);
-        let mut fifo: VecDeque<u64> = VecDeque::with_capacity(4);
-        let mut oracle: VecDeque<u64> = VecDeque::new();
-        let mut next_value: u64 = 0;
+    /// bytes per group in the test conversion: 4 samples as u16 LE
+    const TEST_GROUP_BYTES: usize = 4 * BitDepth::Bits16.bytes();
 
-        for _ in 0..5_000 {
-            // simulate `get_samples()`: push a random-sized chunk of new samples
-            let push_count = rng.usize(0..9);
-            for _ in 0..push_count {
-                fifo.push_back(next_value);
-                oracle.push_back(next_value);
-                next_value += 1;
-            }
-
-            // simulate the `samples_needed` computed in `fill_lpcm_buffer`:
-            // anything from nothing up to the entire current fifo
-            let len = fifo.len();
-            let samples_needed = if len == 0 { 0 } else { rng.usize(0..=len) };
-
-            // --- the logic under test, copied verbatim from fill_lpcm_buffer ---
-            let consumed: Vec<u64> = {
-                let samples = fifo.make_contiguous();
-                samples[..samples_needed].to_vec()
-            };
-            fifo.retain_back(fifo.len() - samples_needed);
-            // --- end logic under test ---
-
-            // the consumed slice must be exactly the oldest `samples_needed`
-            // values, in order
-            let expected_consumed: Vec<u64> = oracle.iter().take(samples_needed).copied().collect();
-            assert_eq!(consumed, expected_consumed);
-            oracle.drain(..samples_needed);
-
-            // what's left in the fifo must match the oracle element-for-element,
-            // in order: no gaps, duplicates, or reordering introduced by the
-            // rotate-then-truncate pair
-            assert_eq!(fifo.len(), oracle.len());
-            assert!(fifo.iter().eq(oracle.iter()));
+    /// Test stand-in for the real converters: write each sample as its u16 LE
+    /// value, so the bytes in the buffer can be decoded back to the samples.
+    fn convert_u16le(out: &mut [u8], groups: &[[f32; 4]]) {
+        assert!(!groups.is_empty());
+        assert_eq!(out.len(), groups.len() * TEST_GROUP_BYTES);
+        let (pairs, _) = out.as_chunks_mut::<2>();
+        for (bytes, s) in pairs.iter_mut().zip(groups.as_flattened()) {
+            *bytes = (*s as u16).to_le_bytes();
         }
     }
 
-    /// Deterministic companion to the randomized invariant test above:
-    /// explicitly construct a fifo whose head has wrapped past the end of
-    /// its backing buffer (via push/pop churn on a tiny capacity) *before*
-    /// `make_contiguous()` is ever called, then run one consume cycle and
-    /// check the result by hand.
+    fn decode_u16le(buf: &[u8]) -> Vec<f32> {
+        let (pairs, _) = buf.as_chunks::<2>();
+        pairs
+            .iter()
+            .map(|&b| f32::from(u16::from_le_bytes(b)))
+            .collect()
+    }
+
+    /// Result of one `SampleCursor::fill` call in `take_sequence`
+    #[derive(Debug, PartialEq)]
+    struct Taken {
+        /// samples decoded from the buffer
+        samples: Vec<f32>,
+        /// number of `convert` calls (contiguous slices handed out)
+        slices: usize,
+        /// number of chunks pushed during this call
+        pushes: usize,
+    }
+
+    /// Feed `chunks` (in order) to a fresh `SampleCursor` through successive
+    /// `fill` calls, one per request of `wanted` groups. Panics if more chunks
+    /// are needed than provided.
+    fn take_sequence(chunks: &[AudioSamples], requests: &[usize]) -> Vec<Taken> {
+        let mut cursor = SampleCursor::default();
+        let mut source = chunks.iter().cloned();
+        requests
+            .iter()
+            .map(|&wanted| {
+                let mut buf = vec![0xAA; wanted * TEST_GROUP_BYTES];
+                let mut slices = 0;
+                let mut pushes = 0;
+                let n = cursor.fill(
+                    &mut buf,
+                    TEST_GROUP_BYTES,
+                    || {
+                        pushes += 1;
+                        source.next().expect("ran out of chunks")
+                    },
+                    |out, groups| {
+                        slices += 1;
+                        convert_u16le(out, groups);
+                    },
+                );
+                assert_eq!(n, buf.len());
+                Taken {
+                    samples: decode_u16le(&buf),
+                    slices,
+                    pushes,
+                }
+            })
+            .collect()
+    }
+
+    /// concatenate the samples of all `take_sequence` results
+    fn all_samples(taken: Vec<Taken>) -> Vec<f32> {
+        taken.into_iter().flat_map(|t| t.samples).collect()
+    }
+
+    fn seq(range: std::ops::Range<u16>) -> Vec<f32> {
+        range.map(f32::from).collect()
+    }
+
     #[test]
-    fn test_make_contiguous_retain_back_after_wraparound() {
-        use std::collections::VecDeque;
-
-        let mut fifo: VecDeque<u32> = VecDeque::with_capacity(4);
-        // churn the ring buffer so head != 0 and the live range wraps
-        // past the end of the backing storage
-        for v in 0..4 {
-            fifo.push_back(v);
-        }
-        for _ in 0..3 {
-            fifo.pop_front();
-        }
-        for v in 4..9 {
-            fifo.push_back(v); // [3, 4, 5, 6, 7, 8], wrapped internally
-        }
+    fn test_sample_cursor_aligned_chunks_zero_copy() {
+        // aligned chunks are handed out as one slice per chunk, no stitching
+        let chunks = numbered_chunks(&[8, 8]);
+        let out = take_sequence(&chunks, &[4]);
         assert_eq!(
-            fifo.iter().copied().collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8]
+            out,
+            vec![Taken {
+                samples: seq(0..16),
+                slices: 2,
+                pushes: 2
+            }]
         );
+    }
 
-        let samples_needed = 2;
-        let consumed: Vec<u32> = {
-            let samples = fifo.make_contiguous();
-            samples[..samples_needed].to_vec()
-        };
-        fifo.retain_back(fifo.len() - samples_needed);
+    #[test]
+    fn test_sample_cursor_stitches_group_across_boundary() {
+        // 6 = one whole group + 2 leftovers, completed by 2 samples of the next chunk
+        let chunks = numbered_chunks(&[6, 6]);
+        let out = take_sequence(&chunks, &[3]);
+        // slices: [0..4] from chunk 1, stitched head [4..8], [8..12] from chunk 2
+        assert_eq!(
+            out,
+            vec![Taken {
+                samples: seq(0..12),
+                slices: 3,
+                pushes: 2
+            }]
+        );
+    }
 
-        assert_eq!(consumed, vec![3, 4]);
-        assert_eq!(fifo.iter().copied().collect::<Vec<_>>(), vec![5, 6, 7, 8]);
+    #[test]
+    fn test_sample_cursor_stitch_plus_groups_plus_new_carry() {
+        // chunk 2 completes the carried group (2 + 2), has 1 whole group of
+        // its own, and leaves 1 sample as new carry for chunk 3
+        let chunks = numbered_chunks(&[6, 7, 3]);
+        let out = take_sequence(&chunks, &[4]);
+        // slices: [0..4], head [4..8], [8..12], head [12..16]
+        assert_eq!(
+            out,
+            vec![Taken {
+                samples: seq(0..16),
+                slices: 4,
+                pushes: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sample_cursor_stitch_without_groups_leaves_new_carry() {
+        // chunk 2 completes the carried group (3 + 1) but its remaining
+        // sample is too few for a whole group and becomes the new carry
+        let chunks = numbered_chunks(&[3, 2, 3]);
+        let out = take_sequence(&chunks, &[2]);
+        // slices: head [0..4], head [4..8]
+        assert_eq!(
+            out,
+            vec![Taken {
+                samples: seq(0..8),
+                slices: 2,
+                pushes: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sample_cursor_keeps_leftover_across_calls() {
+        let chunks = numbered_chunks(&[10, 10]);
+        let out = take_sequence(&chunks, &[1, 2, 2]);
+        assert_eq!(out[0].samples, seq(0..4));
+        assert_eq!(out[1].samples, seq(4..12));
+        assert_eq!(out[2].samples, seq(12..20));
+        // the 3rd request is served from leftovers only, no new chunk
+        assert_eq!(out[2].pushes, 0);
+    }
+
+    #[test]
+    fn test_sample_cursor_tiny_and_empty_chunks() {
+        // groups completed from several chunks shorter than 4, incl. empty ones
+        let chunks = numbered_chunks(&[3, 0, 1, 0, 2, 1, 1]);
+        let out = take_sequence(&chunks, &[2]);
+        // [3] -> carry, [] -> nothing, [1] -> group 0..4, [] -> nothing,
+        // [2] -> carry, [1] -> carry, [1] -> group 4..8
+        assert_eq!(
+            out,
+            vec![Taken {
+                samples: seq(0..8),
+                slices: 2,
+                pushes: 7
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sample_cursor_zero_groups_needs_no_chunk() {
+        // an empty read must not block waiting for a chunk
+        let out = take_sequence(&[], &[0]);
+        assert_eq!(
+            out,
+            vec![Taken {
+                samples: Vec::new(),
+                slices: 0,
+                pushes: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn test_sample_cursor_fill_leaves_partial_group_tail_untouched() {
+        // a buffer that is not a multiple of the group size: only whole
+        // groups are written, the tail keeps its contents
+        let chunks = numbered_chunks(&[16]);
+        let mut cursor = SampleCursor::default();
+        let mut source = chunks.into_iter();
+        let mut buf = vec![0xAA; 3 * TEST_GROUP_BYTES + 5];
+        let n = cursor.fill(
+            &mut buf,
+            TEST_GROUP_BYTES,
+            || source.next().expect("ran out of chunks"),
+            convert_u16le,
+        );
+        assert_eq!(n, 3 * TEST_GROUP_BYTES);
+        assert_eq!(decode_u16le(&buf[..n]), seq(0..12));
+        assert!(buf[n..].iter().all(|&b| b == 0xAA));
+        // the unread 4th group is still there for the next fill
+        let mut buf = vec![0; TEST_GROUP_BYTES];
+        let n = cursor.fill(&mut buf, TEST_GROUP_BYTES, || unreachable!(), convert_u16le);
+        assert_eq!(n, TEST_GROUP_BYTES);
+        assert_eq!(decode_u16le(&buf), seq(12..16));
+    }
+
+    #[test]
+    fn test_sample_cursor_cpal_like_chunk_sizes() {
+        // 441 stereo frames = 882 samples, not a multiple of 4
+        let chunks = numbered_chunks(&[882; 5]);
+        let out = take_sequence(&chunks, &[300, 300, 502]);
+        assert_eq!(all_samples(out), seq(0..4408));
+    }
+
+    /// Randomized invariant: whatever the chunk lengths and request sizes, the
+    /// concatenated output is exactly the concatenated input, in order, and
+    /// the groups of a chunk are handed out as one slice (no copy) unless the
+    /// request ends inside it.
+    #[test]
+    fn test_sample_cursor_random_invariant() {
+        let mut rng = Rng::with_seed(0x5a17_u64);
+        for _ in 0..200 {
+            // mostly tiny chunks (lots of stitching), some bigger ones (lots
+            // of whole groups per chunk, to catch a regression to one slice
+            // per group)
+            let lens: Vec<usize> = (0..50)
+                .map(|_| {
+                    if rng.bool() {
+                        rng.usize(0..13)
+                    } else {
+                        rng.usize(13..41)
+                    }
+                })
+                .collect();
+            let total: usize = lens.iter().sum();
+            let chunks = numbered_chunks(&lens);
+            let mut requests = Vec::new();
+            let mut left = total / 4;
+            while left > 0 {
+                let n = rng.usize(0..=left.min(10));
+                requests.push(n);
+                left -= n;
+            }
+            let out = take_sequence(&chunks, &requests);
+            for t in &out {
+                // each push yields at most a stitched head plus one slice of
+                // whole groups; state left over from the previous request can
+                // add one more of each
+                assert!(
+                    t.slices <= 2 * t.pushes + 2,
+                    "{} slices for {} pushes",
+                    t.slices,
+                    t.pushes
+                );
+            }
+            assert_eq!(all_samples(out), seq(0..(total / 4 * 4) as u16));
+        }
+    }
+
+    /// 2 groups of exactly representable samples, including both clip limits
+    const TEST_GROUPS: [[f32; 4]; 2] = [[0.0, 0.5, -0.5, 0.25], [-0.25, 1.0, -1.0, 0.125]];
+
+    fn convert_groups(fmt: LpcmFormat, groups: &[[f32; 4]]) -> Vec<u8> {
+        let mut out = vec![0u8; groups.len() * fmt.bytes_per_group()];
+        fmt.convert(&mut out, groups);
+        out
+    }
+
+    /// decode `bytes_per_sample`-wide signed samples in the given byte order
+    fn decode_signed(buf: &[u8], bytes_per_sample: usize, endian: Endian) -> Vec<i32> {
+        buf.chunks_exact(bytes_per_sample)
+            .map(|s| {
+                let mut be = s.to_vec();
+                if endian == Little {
+                    be.reverse();
+                }
+                // sign-extend from the most significant byte
+                be.iter()
+                    .skip(1)
+                    .fold(i32::from(be[0] as i8), |acc, &b| (acc << 8) | i32::from(b))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_lpcm_format_bytes_per_group() {
+        for endian in [Little, Big] {
+            for dither in [Dither, NoDither] {
+                let f16 = LpcmFormat {
+                    endian,
+                    bd: Bits16,
+                    dither,
+                };
+                let f24 = LpcmFormat {
+                    endian,
+                    bd: Bits24,
+                    dither,
+                };
+                assert_eq!(f16.bytes_per_group(), 8);
+                assert_eq!(f24.bytes_per_group(), 12);
+            }
+        }
+    }
+
+    /// every undithered arm must match its reference quantizer/packer pair
+    #[test]
+    fn test_lpcm_format_convert_matches_reference() {
+        type Quantize = fn(f32x4) -> [i32; 4];
+        type Pack = fn(&[i32; 4], &mut [u8]);
+        type Case = (Endian, BitDepth, Dither, Quantize, Pack);
+        let cases: [Case; 4] = [
+            (Little, Bits16, NoDither, f32x4_to_i32x4_16, i32_to_i16le),
+            (Big, Bits16, NoDither, f32x4_to_i32x4_16, i32_to_i16be),
+            (Little, Bits24, NoDither, f32x4_to_i32x4_24, i32_to_i24le),
+            (Big, Bits24, NoDither, f32x4_to_i32x4_24, i32_to_i24be),
+        ];
+        for (endian, bd, dither, quantize, pack) in cases {
+            let fmt = LpcmFormat { endian, bd, dither };
+            let mut expected = Vec::new();
+            for g in &TEST_GROUPS {
+                let mut b = vec![0u8; fmt.bytes_per_group()];
+                pack(&quantize(f32x4::new(*g)), &mut b);
+                expected.extend(b);
+            }
+            assert_eq!(convert_groups(fmt, &TEST_GROUPS), expected, "{fmt:?}");
+        }
+    }
+
+    /// 24 bit ignores the dither setting
+    #[test]
+    fn test_lpcm_format_24bit_never_dithered() {
+        for endian in [Little, Big] {
+            let d = LpcmFormat {
+                endian,
+                bd: Bits24,
+                dither: Dither,
+            };
+            let nd = LpcmFormat {
+                endian,
+                bd: Bits24,
+                dither: NoDither,
+            };
+            assert_eq!(
+                convert_groups(d, &TEST_GROUPS),
+                convert_groups(nd, &TEST_GROUPS)
+            );
+        }
+    }
+
+    /// little and big endian decode to the same, correctly scaled values
+    #[test]
+    fn test_lpcm_format_endianness_and_scale() {
+        let input = TEST_GROUPS.as_flattened();
+        for (bd, bytes, full_scale) in [(Bits16, 2, 32767.0f32), (Bits24, 3, 8_388_607.0)] {
+            let le = LpcmFormat {
+                endian: Little,
+                bd,
+                dither: NoDither,
+            };
+            let be = LpcmFormat {
+                endian: Big,
+                bd,
+                dither: NoDither,
+            };
+            let le_vals = decode_signed(&convert_groups(le, &TEST_GROUPS), bytes, Little);
+            let be_vals = decode_signed(&convert_groups(be, &TEST_GROUPS), bytes, Big);
+            assert_eq!(le_vals, be_vals, "{bd:?}");
+            for (&got, &s) in le_vals.iter().zip(input) {
+                let want = s * full_scale;
+                assert!((got as f32 - want).abs() <= 1.0, "{bd:?}: {s} -> {got}");
+            }
+        }
+    }
+
+    /// dithered 16 bit stays within a couple of LSBs of the undithered value
+    #[test]
+    fn test_lpcm_format_16bit_dither_close_to_undithered() {
+        for endian in [Little, Big] {
+            let d = LpcmFormat {
+                endian,
+                bd: Bits16,
+                dither: Dither,
+            };
+            let nd = LpcmFormat {
+                endian,
+                bd: Bits16,
+                dither: NoDither,
+            };
+            let dv = decode_signed(&convert_groups(d, &TEST_GROUPS), 2, endian);
+            let ndv = decode_signed(&convert_groups(nd, &TEST_GROUPS), 2, endian);
+            for (a, b) in dv.iter().zip(&ndv) {
+                assert!((a - b).abs() <= 2, "{endian:?}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_recv_or_silence_returns_chunk() {
+        let (tx, rx) = crossbeam_channel::unbounded::<AudioSamples>();
+        let silence: AudioSamples = vec![0.0f32; 8].into();
+        let chunk: AudioSamples = vec![0.5f32; 4].into();
+        tx.send(chunk.clone()).unwrap();
+        let got = recv_or_silence(&rx, Duration::from_millis(100), &silence);
+        assert!(Arc::ptr_eq(&got, &chunk));
+    }
+
+    #[test]
+    fn test_recv_or_silence_times_out_to_silence() {
+        let (_tx, rx) = crossbeam_channel::unbounded::<AudioSamples>();
+        let silence: AudioSamples = vec![0.0f32; 8].into();
+        let got = recv_or_silence(&rx, Duration::from_millis(1), &silence);
+        assert!(Arc::ptr_eq(&got, &silence));
+    }
+
+    #[test]
+    fn test_recv_or_silence_disconnected_gives_silence() {
+        let (tx, rx) = crossbeam_channel::unbounded::<AudioSamples>();
+        drop(tx);
+        let silence: AudioSamples = vec![0.0f32; 8].into();
+        let got = recv_or_silence(&rx, Duration::from_millis(100), &silence);
+        assert!(Arc::ptr_eq(&got, &silence));
     }
 
     use dasp_sample::{I24, Sample};
@@ -855,82 +1314,69 @@ mod tests {
         assert_eq!(b1, b2);
     }
 
-    /// Build a full `VecDeque<u8>` (`len() == cap`) holding `values` in logical
-    /// order, whose live range is physically split at `head_offset` bytes
-    /// from the end of its backing storage (via push/pop churn that never
-    /// exceeds `cap`, so no reallocation straightens it out), giving
-    /// `as_slices()` two non-empty slices: `cap - head_offset` bytes then
-    /// `head_offset` bytes.
-    fn wrapped_fifo(cap: usize, head_offset: usize, values: &[u8]) -> VecDeque<u8> {
-        assert_eq!(values.len(), cap);
-        assert!(head_offset > 0 && head_offset < cap);
-        let mut fifo: VecDeque<u8> = VecDeque::with_capacity(cap);
-        for v in 0..cap as u8 {
-            fifo.push_back(v);
-        }
-        for _ in 0..head_offset {
-            fifo.pop_front();
-        }
-        for v in 0..head_offset as u8 {
-            fifo.push_back(v);
-        }
-        for (i, &v) in values.iter().enumerate() {
-            fifo[i] = v;
-        }
-        fifo
+    /// Feed `chunks` (in order) to a fresh `ChunkCursor` through successive
+    /// `fill` calls with the given buffer sizes, returning what each call
+    /// produced. Panics if the cursor asks for more chunks than provided.
+    fn fill_sequence(chunks: &[&[u8]], buf_sizes: &[usize]) -> Vec<Vec<u8>> {
+        let mut cursor = ChunkCursor::default();
+        let mut source = chunks.iter().map(|c| c.to_vec());
+        buf_sizes
+            .iter()
+            .map(|&size| {
+                let mut buf = vec![0u8; size];
+                let n = cursor
+                    .fill(&mut buf, || source.next().ok_or("out of chunks"))
+                    .unwrap();
+                assert_eq!(n, size);
+                buf
+            })
+            .collect()
     }
 
     #[test]
-    fn test_copy_fifo_front_split_across_wrap() {
-        let values: Vec<u8> = (10..=80).step_by(10).collect();
-        let fifo = wrapped_fifo(8, 6, &values);
-        assert_eq!(fifo.as_slices().0.len(), 2);
-        assert_eq!(fifo.as_slices().1.len(), 6);
+    fn test_chunk_cursor_buf_spans_several_chunks() {
+        let out = fill_sequence(&[&[1, 2], &[3, 4, 5], &[6]], &[6]);
+        assert_eq!(out, vec![vec![1, 2, 3, 4, 5, 6]]);
+    }
 
-        // buf spans both the 2-byte first slice and part of the second
+    #[test]
+    fn test_chunk_cursor_chunk_spans_several_bufs() {
+        let out = fill_sequence(&[&[1, 2, 3, 4, 5, 6, 7]], &[3, 2, 2]);
+        assert_eq!(out, vec![vec![1, 2, 3], vec![4, 5], vec![6, 7]]);
+    }
+
+    #[test]
+    fn test_chunk_cursor_keeps_leftover_across_calls() {
+        // leftover [4, 5] of the first chunk must come out before the next chunk
+        let out = fill_sequence(&[&[1, 2, 3, 4, 5], &[6, 7, 8]], &[3, 4, 1]);
+        assert_eq!(out, vec![vec![1, 2, 3], vec![4, 5, 6, 7], vec![8]]);
+    }
+
+    #[test]
+    fn test_chunk_cursor_exact_chunk_boundaries() {
+        let out = fill_sequence(&[&[1, 2], &[3, 4]], &[2, 2]);
+        assert_eq!(out, vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn test_chunk_cursor_skips_empty_chunks() {
+        let out = fill_sequence(&[&[], &[1], &[], &[], &[2, 3]], &[3]);
+        assert_eq!(out, vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn test_chunk_cursor_empty_buf_needs_no_chunk() {
+        // an empty read must not block waiting for a chunk
+        let out = fill_sequence(&[], &[0]);
+        assert_eq!(out, vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn test_chunk_cursor_propagates_source_error() {
+        let mut cursor = ChunkCursor::default();
+        let mut source = vec![vec![1u8, 2]].into_iter();
         let mut buf = [0u8; 4];
-        copy_fifo_front(&fifo, &mut buf);
-        assert_eq!(buf, [10, 20, 30, 40]);
-    }
-
-    #[test]
-    fn test_copy_fifo_front_entirely_from_first_slice() {
-        let values: Vec<u8> = (10..=80).step_by(10).collect();
-        let fifo = wrapped_fifo(8, 6, &values);
-
-        let mut buf = [0u8; 2];
-        copy_fifo_front(&fifo, &mut buf);
-        assert_eq!(buf, [10, 20]);
-    }
-
-    #[test]
-    fn test_copy_fifo_front_exact_fifo_len() {
-        let values: Vec<u8> = (10..=80).step_by(10).collect();
-        let fifo = wrapped_fifo(8, 6, &values);
-
-        let mut buf = [0u8; 8];
-        copy_fifo_front(&fifo, &mut buf);
-        assert_eq!(buf, values.as_slice());
-    }
-
-    #[test]
-    fn test_copy_fifo_front_contiguous_no_wrap() {
-        let mut fifo: VecDeque<u8> = VecDeque::new();
-        fifo.extend([1, 2, 3, 4]);
-        assert!(fifo.as_slices().1.is_empty());
-
-        let mut buf = [0u8; 3];
-        copy_fifo_front(&fifo, &mut buf);
-        assert_eq!(buf, [1, 2, 3]);
-    }
-
-    #[test]
-    fn test_copy_fifo_front_empty_buf() {
-        let values: Vec<u8> = (10..=80).step_by(10).collect();
-        let fifo = wrapped_fifo(8, 6, &values);
-
-        let mut buf: [u8; 0] = [];
-        copy_fifo_front(&fifo, &mut buf);
-        assert_eq!(buf, [] as [u8; 0]);
+        let result = cursor.fill(&mut buf, || source.next().ok_or("closed"));
+        assert_eq!(result, Err("closed"));
     }
 }

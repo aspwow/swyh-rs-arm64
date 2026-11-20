@@ -48,16 +48,13 @@ winres = "0.1.12"
 cpal = { version = "0.18.2" }
 anyhow = "1"
 crossbeam-channel = "0.5.17"
-ctrlc = { version = "3.5.2", features = ["termination"], optional = true }
+ctrlc = { version = "3.5.3", features = ["termination"], optional = true }
 dasp_sample = "0.11.0"
 dirs = "7.0.0"
 ecow = "0.3.1"
 fastrand = "2.5.0"
 fluent-uri = "0.4.1"
-fluent-templates = { version = "0.15.1", default-features = false, features = [
-    "macros",
-    "walkdir",
-] }
+fluent-bundle = "0.16.0"
 figura = { version = "3.2.0", features = ["zmij", "foldhash"] }
 flac-bound = { version = "0.5.0", default-features = false, features = [
     "libflac-noogg",
@@ -81,15 +78,16 @@ serde = { version = "1.0.229", features = ["derive"] }
 socket2 = "0.6.5"
 simplelog = { version = "0.12.2", features = ["local-offset"] }
 sys-locale = "0.3"
-tiny_http_dh = { version = "0.12.3" }
-toml = "1.2.0"
-ureq = { version = "3.5.1", default-features = false, features = [
+tiny_http_dh = { version = "0.12.4" }
+toml = "1.2.1"
+unic-langid = "0.9.6"
+ureq = { version = "3.5.2", default-features = false, features = [
     "charset",
     "gzip",
 ] }
 wide = "1.7.1"
 xml = "1.4.0"
-arc-swap = "1.9.3"
+arc-swap = "1.9.5"
 
 [target.'cfg(windows)'.dependencies]
 fltk = { version = "1.5.23", features = ["use-ninja"], optional = true }
@@ -97,7 +95,6 @@ fltk-theme = { version = "0.7.9", optional = true }
 winapi-easy = { version = "0.3.0", default-features = false, features = [
     "process",
 ] }
-winres = "0.1.12"
 
 [target.'cfg(unix)'.dependencies]
 fltk = { version = "1.5.23", features = ["use-ninja"], optional = true }

@@ -4,8 +4,8 @@
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::AtomicBool};
 
 use crate::{
-    audio::rwstream::ChannelStream, enums::messages::MessageType,
-    globals::renderer_kind::RendererKind, utils::configuration::Configuration,
+    audio::rwstream::ChannelStream, enums::messages::MessageType, globals::RendererKind,
+    utils::configuration::Configuration,
 };
 
 use arc_swap::{ArcSwap, Guard};
@@ -16,6 +16,10 @@ use hashbrown::HashMap;
 /// app version
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_DATE: Option<&str> = option_env!("BUILD_DAY");
+/// copyright notice, keep in sync with the LICENSE file
+pub const COPYRIGHT: &str = "Copyright (c) 2020-2026 dheijl";
+/// project home page
+pub const APP_URL: &str = "https://github.com/dheijl/swyh-rs";
 
 /// the HTTP server port
 pub const SERVER_PORT: u16 = 5901;
@@ -166,10 +170,7 @@ pub fn get_config_mut() -> RwLockWriteGuard<'static, Configuration> {
 }
 
 /// Mutates the shared config with `f`, persists it to disk, and returns `f`'s result.
-///
-/// The write lock is held only for the duration of the call, so the guard can
-/// never accidentally outlive the update. A failed save is logged, not propagated.
-///
+/// Assures the write lock is immediately dropped, A failed save is logged, not propagated.
 /// Uses `log::`, so only call this after logging has been set up.
 pub fn update_config_with<R>(f: impl FnOnce(&mut Configuration) -> R) -> R {
     let mut conf = get_config_mut();

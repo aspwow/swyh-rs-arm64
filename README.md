@@ -48,7 +48,7 @@ I wrote this because
 - I wanted to learn Rust
 - SWYH does not work on Linux
 - SWYH did not work well with Volumio (push streaming did not work)
-- SWYH has a substantial memory leak due to the use of an old and unmaintained Intel .Net UPNP/DLNA library it uses.
+- SWYH has (had) a substantial memory leak due to the use of an old and unmaintained Intel .Net UPNP/DLNA library it uses.
 
 **NOTE** swyh-rs does not support lossy mp3 or aac re-encoding, only lossless LPCM/WAV/RF64/FLAC for obvious reasons.
 
@@ -179,9 +179,9 @@ When swyh-rs starts, it:
 - runs **SSDP** discovery to find all UPnP/DLNA/OpenHome media renderers on the local network (takes about four seconds)
 - if enabled, listens for **SlimProto** (squeezelite) clients, see [SlimProto (Squeezelite) support](#slimproto-squeezelite-support)
 - displays a button for every discovered renderer, together with a volume slider if the renderer supports volume control — drag the slider to change the volume; hold Shift while dragging to copy the new volume to all currently active renderers
-- clicking a renderer button uses the OpenHome or AvTransport protocol to instruct it to play the audio stream from the built-in web server
+- clicking a renderer button uses the OpenHome/AvTransport/SlimProto protocol to instruct it to play the audio stream from the built-in web server
 
-SSDP discovery reruns every x minutes in the background; newly found renderers are added automatically. Renderers that disappear are kept in the GUI since SSDP (UDP-based) is not guaranteed reliable.
+SSDP discovery reruns every x minutes in the background; newly found renderers are added automatically. Renderers that disappear are kept in the GUI since SSDP (UDP-based) is not guaranteed reliable. Setting the SSP interval to 0 disables the SSDP discovery, causing swyh-rs to run in "serve-only" mode where the player has to start the streaming, like explained below.
 
 You can also enter the web server URL directly in a renderer — for instance in MoOde as a web radio at `http://{ip_address}:5901/stream/swyh.flac` — so you can start playing from the renderer's own UI while swyh-rs is running.
 
@@ -204,7 +204,7 @@ Since version 1.20.3-RC4, thanks to contributions by @Churro:
 
 A diagram showing the flow of the audio samples:
 
-<img width="960" height="880" alt="audio_flow" src="https://github.com/user-attachments/assets/23b08562-4d63-4c6f-894a-502661cafbe3" />
+<img width="960" height="1010" alt="audio_flow" src="https://github.com/user-attachments/assets/8c64e3a9-6eab-412d-9ee4-081432640937" />
 
 The **configuration UI** is organised into four tabs:
 

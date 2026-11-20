@@ -108,7 +108,7 @@ pub(crate) const U64MAXNOTCHUNKED: (Option<usize>, usize) =
 
 impl StreamSize {
     #[must_use]
-    pub fn values(&self) -> (Option<usize>, usize) {
+    pub const fn values(&self) -> (Option<usize>, usize) {
         match self {
             StreamSize::NoneChunked => NONECHUNKED,
             StreamSize::U32maxChunked => U32MAXCHUNKED,
@@ -169,10 +169,18 @@ pub enum BitDepth {
 impl BitDepth {
     /// Right-shift applied to an `i32` sample to extract the target bit depth.
     /// `i32 >> 8` yields 24 significant bits; `i32 >> 16` yields 16.
-    pub fn shift_value(&self) -> u8 {
+    pub const fn shift_value(&self) -> u8 {
         match self {
             BitDepth::Bits24 => 8u8,
             BitDepth::Bits16 => 16u8,
+        }
+    }
+
+    /// Number of bytes per sample in the output stream.
+    pub const fn bytes(self) -> usize {
+        match self {
+            BitDepth::Bits16 => 2,
+            BitDepth::Bits24 => 3,
         }
     }
 }
@@ -277,10 +285,15 @@ impl StreamingContext {
         // to buffering the *entire* response body into memory via `read_to_end()`
         // before writing anything at all — fatal for a live/infinite audio
         // stream, which never returns EOF (verified against tiny_http 0.12's
-        // `Response::raw_print`). SlimProto clients (squeezelite) always request
-        // HTTP/1.0, so force one of the "NotChunked" variants (a large declared
-        // size, same trick already used for the WAV/RF64 headers' own "infinite"
-        // size fields) whenever nothing more specific was already requested.
+        // `Response::raw_print`). SlimProto requests arrive as HTTP/1.0 because
+        // *we* put that request line in the `strm` packet (`slimproto/strm.rs`):
+        // squeezelite sends the server-supplied header verbatim (`stream_sock()`
+        // / `send_header()` in its `stream.c`). It must stay 1.0: squeezelite
+        // treats everything after the response headers as raw body and has no
+        // chunked-decoding support. So force one of the "NotChunked" variants (a
+        // large declared size, same trick already used for the WAV/RF64 headers'
+        // own "infinite" size fields) whenever nothing more specific was already
+        // requested.
         let (streamsize, chunksize) = if streamsize.is_none() && *rq.http_version() <= (1, 0) {
             StreamSize::U64maxNotChunked.values()
         } else {
@@ -312,7 +325,7 @@ impl StreamingContext {
 
     /// Byte length of the WAV/RF64 header prepended to this stream, or 0 for LPCM/FLAC.
     #[inline]
-    pub fn wav_header_size(&self) -> usize {
+    pub const fn wav_header_size(&self) -> usize {
         match self.streaming_format {
             StreamingFormat::Wav => 44,
             StreamingFormat::Rf64 => 80,
